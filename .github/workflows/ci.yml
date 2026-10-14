@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Runners are pinned, not ubuntu-latest, so an image change is a commit here
+# rather than a surprise. uv is pinned to the version in the Dockerfile.
+env:
+  UV_VERSION: "0.12.24"
+  GITLEAKS_VERSION: "8.23.3"
+
+jobs:
+  quality:
+    name: Lint, types, unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # --locked: fail if uv.lock is out of date with pyproject.toml,
+      # instead of quietly resolving something else than developers run.
+      - name: Install from the lockfile
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy (strict)
+        run: uv run mypy
+
+      - name: Pytest
+        run: uv run pytest -m "not integration" --cov-report=xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  integration:
+    name: Round trip through Redpanda
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install from the lockfile
+        run: uv sync --locked
+
+      # The same docker-compose.yml as on a laptop, so CI tests the stack
+      # people actually run. --wait blocks until the healthcheck passes.
+      - name: Start Redpanda
+        run: docker compose up -d --wait redpanda
+
+      - name: Integration tests
+        run: uv run pytest -m integration --no-cov
+
+      - name: Redpanda logs
+        if: failure()
+        run: docker compose logs redpanda
+
+      - name: Stop Redpanda
+        if: always()
+        run: docker compose down --volumes
+
+  image:
+    name: Producer image builds and starts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: docker compose build producer
+
+      # The entrypoint resolves and the package imports inside the image.
+      - name: Smoke test
+        run: docker run --rm wiki-edits-streaming-producer:dev --help
+
+  security:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # full history: a secret deleted later is still leaked
+
+      # The gitleaks binary, not gitleaks-action: it scans the whole history
+      # the same way locally and in CI, and survives force-pushes.
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan full git history
+        run: gitleaks git . --redact --verbose --no-banner

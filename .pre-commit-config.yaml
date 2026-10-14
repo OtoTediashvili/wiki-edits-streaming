@@ -1,0 +1,47 @@
+# Hooks that run on every `git commit`.
+#
+# ruff and mypy run from the project's own .venv (repo: local), not from
+# pre-commit's isolated environments: one toolchain, pinned by uv.lock and
+# shared by pre-commit, `make check` and CI. An isolated mypy would lack the
+# project's dependencies and judge the code differently from CI.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # The fixture is a recorded stream, kept byte-for-byte. Never rewrite it.
+      - id: trailing-whitespace
+        exclude: ^tests/fixtures/
+      - id: end-of-file-fixer
+        exclude: ^tests/fixtures/
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: .venv/bin/ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: .venv/bin/ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy (project venv, same as make check)
+        entry: .venv/bin/mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.23.3
+    hooks:
+      - id: gitleaks

@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "WikiChange",
+  "namespace": "io.github.ototediashvili.wikistream",
+  "doc": "One change from Wikimedia's recentchange stream. Common fields are typed; the original event is kept whole in `raw`, so nothing the source sent is ever lost. Optional fields default to null, so adding one later is a backward-compatible change.",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "meta.id: unique per event, stable across redelivery. The deduplication key."},
+    {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "When the change happened (source `timestamp`, whole seconds). Windows and watermarks use this."},
+    {"name": "stream_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "meta.dt: when Wikimedia published the event."},
+    {"name": "type", "type": "string", "doc": "edit, new, log, categorize, external. A string, not an enum: a new value from the source must not break readers."},
+    {"name": "wiki", "type": "string", "doc": "Database name, e.g. enwiki, commonswiki."},
+    {"name": "server_name", "type": "string"},
+    {"name": "namespace", "type": "int"},
+    {"name": "title", "type": "string"},
+    {"name": "user", "type": ["null", "string"], "default": null},
+    {"name": "bot", "type": "boolean"},
+    {"name": "minor", "type": ["null", "boolean"], "default": null},
+    {"name": "patrolled", "type": ["null", "boolean"], "default": null},
+    {"name": "rc_id", "type": ["null", "long"], "default": null, "doc": "Recent-changes id. Missing on some log types, so it is not a key."},
+    {"name": "length_old", "type": ["null", "int"], "default": null},
+    {"name": "length_new", "type": ["null", "int"], "default": null},
+    {"name": "revision_old", "type": ["null", "long"], "default": null},
+    {"name": "revision_new", "type": ["null", "long"], "default": null},
+    {"name": "log_type", "type": ["null", "string"], "default": null},
+    {"name": "log_action", "type": ["null", "string"], "default": null},
+    {"name": "source_topic", "type": "string", "doc": "meta.topic: Wikimedia's Kafka topic, one per datacenter."},
+    {"name": "source_partition", "type": "int"},
+    {"name": "source_offset", "type": "long"},
+    {"name": "schema_uri", "type": "string", "doc": "The source's own $schema, e.g. /mediawiki/recentchange/1.0.0."},
+    {"name": "raw", "type": "string", "doc": "The event exactly as received, as JSON text."}
+  ]
+}

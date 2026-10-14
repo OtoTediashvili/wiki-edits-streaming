@@ -1,0 +1,8 @@
+# The image needs pyproject.toml, uv.lock, README.md and src/. Everything else
+# stays out of the build context: smaller, faster, and no secrets.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+**/__pycache__
