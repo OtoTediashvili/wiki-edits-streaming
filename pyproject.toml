@@ -18,8 +18,9 @@ wikistream = "wikistream.__main__:main"
 dev = [
     "mypy>=2.4",
     "pre-commit>=4",
-    "pyarrow>=20,<26",
-    "pyiceberg[pyarrow]>=0.12,<0.13",
+    # A catalog in a SQLite file, and writes to day-partitioned tables: the
+    # dashboard's tests read real Iceberg tables without SeaweedFS.
+    "pyiceberg[pyiceberg-core,sql-sqlite]>=0.12,<0.13",
     "pytest>=9.1",
     "pytest-cov>=7",
     "respx>=0.23",
@@ -28,14 +29,21 @@ dev = [
 spark = [
     "pyspark==4.0.4",
 ]
+dashboard = [
+    "duckdb>=1.5.6,<2",
+    "pyarrow>=20,<26",
+    "pyiceberg[pyarrow]>=0.12,<0.13",
+    "streamlit>=1.65,<2",
+]
 
 [tool.uv]
 # uv.lock was written by uv 0.11.32; older versions can't read it. CI and the
 # Dockerfiles pin 0.12.24.
 required-version = ">=0.11.32"
-# `uv sync` installs both groups for development. The images pick what they
-# need: the producer image takes no group, the Spark image only `spark`.
-default-groups = ["dev", "spark"]
+# `uv sync` installs every group for development. The images pick what they
+# need: the producer image takes no group, the Spark image only `spark`, the
+# dashboard image only `dashboard`.
+default-groups = ["dev", "spark", "dashboard"]
 
 [build-system]
 requires = ["hatchling"]
@@ -66,8 +74,9 @@ files = ["src", "tests"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-# PyArrow ships no type information.
-module = ["pyarrow", "pyarrow.*"]
+# PyArrow and pandas ship no type information (pandas' lives in a separate
+# stubs package, too strict for the few frames handed to Streamlit here).
+module = ["pyarrow", "pyarrow.*", "pandas", "pandas.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------- pytest

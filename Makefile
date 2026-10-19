@@ -91,6 +91,21 @@ lake-reset: ## Delete the Iceberg tables and the job's checkpoint; keeps Redpand
 	docker volume rm --force wiki-edits-streaming_seaweedfs-data wiki-edits-streaming_spark-checkpoints
 	@echo "Lake emptied. make up, then make stream rebuilds it from what Redpanda holds (48 h)."
 
+# ------------------------------------------------------------------ dashboard
+
+dashboard: ## Start the live dashboard on http://localhost:8501 (builds the image)
+	docker compose up -d --build --wait dashboard
+	@echo "Dashboard: http://localhost:8501"
+
+dashboard-stop: ## Stop the dashboard
+	docker compose stop dashboard
+
+dashboard-logs: ## Follow the dashboard's logs
+	docker compose logs -f dashboard
+
+dashboard-dev: ## Run the dashboard from this checkout; reloads on save (needs make up)
+	uv run python -m wikistream.dashboard --server.address 127.0.0.1 --server.runOnSave true
+
 # ------------------------------------------------------------------ inspect
 
 topics: ## List topics with partitions and retention
@@ -108,4 +123,5 @@ clean: ## Remove local caches and the venv
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov coverage.xml
 
 .PHONY: help install fmt lint typecheck test test-integration test-e2e check up down reset ps \
-	produce stop logs replay stream stream-stop stream-logs peek lake-reset topics consume partitions clean
+	produce stop logs replay stream stream-stop stream-logs peek lake-reset \
+	dashboard dashboard-stop dashboard-logs dashboard-dev topics consume partitions clean

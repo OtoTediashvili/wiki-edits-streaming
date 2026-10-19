@@ -14,11 +14,12 @@ flowchart LR
     S -->|each event once| C[(changes)]
     S -->|per wiki per minute| M[(edits_per_minute)]
     C & M --- L[Iceberg tables on SeaweedFS<br/>S3 + REST catalog]
-    L -.->|next| D[Live dashboard]
+    L -->|PyIceberg + DuckDB| D[Live dashboard<br/>Streamlit]
 ```
 
-**Status:** ingestion and the stream job are done, with unit, integration and
-end-to-end tests in CI. The dashboard comes next.
+**Status:** ingestion, the stream job and the live dashboard are done, with
+unit, integration and end-to-end tests in CI. Table maintenance (compaction,
+snapshot expiry) comes next.
 
 ## The data, measured
 
@@ -153,6 +154,54 @@ exact request Spark sends: Spark numbers a new table's columns from 0, and
 SeaweedFS's catalog refuses a partition on column 0. So no table here is
 partitioned by its first column, and a check refuses DDL that would be.
 
+## The dashboard
+
+`make dashboard` serves it on http://localhost:8501. It reads the same two
+Iceberg tables through the same REST catalog, redraws itself every 30
+seconds, and writes nothing.
+
+- **Status line:** *Live*, *Catching up* (with how far behind the clock the
+  newest counts are) or *Stalled* (no commit from the job for 5 minutes,
+  with the command to check it).
+- **Six numbers for the window:** changes per minute, edits, new pages, bot
+  share, distinct editors, net bytes added.
+- **Changes per minute,** people and bots, with a crosshair and the exact
+  numbers on hover.
+- **The busiest wikis,** split into people and bots.
+- **The most edited pages and the newest articles,** with links to them.
+
+A window (15 minutes to 24 hours) and a wiki can be picked, and both go into
+the URL, so `?window=6h&wiki=dewiki` is a link to that view.
+
+**How it reads.** PyIceberg fetches only what the view needs: the per-minute
+counts in the window, and single changes for at most the last hour.
+Iceberg's per-file min/max statistics let a time filter skip every file
+outside the window, so a read costs the same on day one as on day thirty.
+Freshness (the newest minute, the last commit) comes from table metadata
+alone and opens no data file. DuckDB then runs the SQL inside the process,
+over the Arrow tables PyIceberg returned. No query engine to run: the whole
+container uses about 300 MB.
+
+**Numbers that don't lie:**
+
+- *Only complete minutes.* The newest minute is still filling (the job
+  writes every minute, and events arrive seconds late), so the window ends
+  where it begins. Otherwise every chart would end in a drop that isn't
+  there.
+- *Distinct means distinct.* Editors are counted from single changes, never
+  by adding up per-minute counts: someone active in 30 minutes is one
+  editor, not 30.
+- *The window follows the lake, not the clock.* After time away it shows
+  the newest counts there are, labelled with how far behind they are.
+- *A quiet wiki's empty minutes count as zero.* Its rate is per minute of
+  the window, not per minute it happened to have edits.
+
+**Found by looking at it.** The tests passed; a browser set to Tbilisi time
+then showed 06:18 on the axis for 10:18 UTC. Times without a zone reach the
+chart as the viewer's local time, so they now go out as UTC instants on a
+UTC scale, and a test checks the serialized chart. The same session found
+that one theme setting had switched off dark mode.
+
 ## Run it
 
 Needs Docker, [uv](https://docs.astral.sh/uv/) 0.11.32 or newer, make, and
@@ -166,7 +215,8 @@ make check                # lint, strict types, unit tests (Spark ones included)
 make up                   # Redpanda, Console (:8090), SeaweedFS (admin UI :12646)
 make produce              # stream live edits; make logs to follow, make stop to stop
 make stream               # the Spark job; make stream-logs, Spark UI on :4040
-make peek                 # table sizes and the newest minutes
+make dashboard            # the live dashboard on :8501
+make peek                 # table sizes and the newest minutes, in the terminal
 
 make test-integration     # producer -> Redpanda -> consumer
 make test-e2e             # recording -> Redpanda -> Spark -> Iceberg, read back
@@ -179,11 +229,11 @@ the point of keeping the log.
 
 Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 1 GB of heap (roughly 1.5 GB with the JVM around it), SeaweedFS uses about
-200 MB. The whole stack fits in roughly 3 GB.
+200 MB and the dashboard about 300 MB. The whole stack fits in roughly 3.5 GB.
 
 ## Tests
 
-- **95 unit tests** (`make test`), no network or Docker:
+- **154 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the
@@ -196,7 +246,13 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
     writes repaired by the replay, an event from 2009 read as a one-minute
     range instead of seventeen years. One test runs the writer inside a real
     streaming query and restarts it from its checkpoint. Spark's own parser
-    checks the table DDL.
+    checks the table DDL;
+  - the dashboard, over real Iceberg tables in a temporary folder (a SQLite
+    catalog instead of SeaweedFS): every number against a count by hand,
+    reads that open only the files in the window, freshness from metadata
+    alone, and the whole page run headless with Streamlit's AppTest, live,
+    catching up, stalled, before any table exists and with the catalog
+    down.
 - **Integration tests** (`make test-integration`): the recording goes through
   the real producer, Redpanda and schema registry and is read back by a
   consumer; topic retention and repeatable topic creation are checked.
@@ -204,18 +260,23 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   a fresh topic and the Spark image runs the job; then an event three days
   older than all of it arrives and the job runs again. After each run
   PyIceberg reads the tables back: every event exactly once, and per-minute
-  counts that agree with the rows.
+  counts that agree with the rows. Then the dashboard is rendered over what
+  Spark wrote, and each of its numbers is checked against the same number
+  counted from the rows.
 - The tests were checked by breaking the code on purpose: forgetting the
   resume id, resuming a datacenter from "now", retrying a 4xx, saving the position before the broker confirms,
   keeping canaries, skipping schema validation, not checking which events
   are already written, not removing copies within a batch, counting only a
   batch's new events, dropping late events, checking only some of a batch's
   time ranges, reading one range from the oldest event to the newest,
-  swapping bots and humans. Each break fails a test.
+  swapping bots and humans; and on the dashboard, counting the minute still
+  filling, adding up editors instead of counting distinct ones, reading
+  every file and filtering afterwards, letting bots into the busiest pages,
+  sending chart times without a zone. Each break fails a test.
 
 CI runs all of it: lint, strict mypy, unit tests, the integration and
-end-to-end tests against the same `docker-compose.yml`, both image builds,
-and a full-history secret scan.
+end-to-end tests against the same `docker-compose.yml`, all three image
+builds (each started once), and a full-history secret scan.
 
 ## Layout
 
@@ -233,11 +294,17 @@ src/wikistream/
     tables.py         Iceberg DDL, generated from the column specs
     session.py        Spark configuration: connectors, catalog, logging
     job.py            the batch writer, the query, supervision, progress logging
+    catalog.py        the REST catalog for Python readers (PyIceberg)
     peek.py           read the tables from the host with PyIceberg
+  dashboard/
+    lake.py           what the page reads: time-bounded scans, freshness from metadata
+    queries.py        every number on the page, as DuckDB SQL over Arrow
+    app.py            the Streamlit page: status, filters, numbers, charts, tables
 tests/                unit, integration and end-to-end tests, the recorded fixture
-docker-compose.yml    Redpanda, Console, SeaweedFS, producer, Spark job
+docker-compose.yml    Redpanda, Console, SeaweedFS, producer, Spark job, dashboard
 Dockerfile            producer image
 spark.Dockerfile      Spark job image, connector jars fetched at build time
+dashboard.Dockerfile  dashboard image: no Spark, no Java
 ```
 
 ## Stack
@@ -245,7 +312,7 @@ spark.Dockerfile      Spark job image, connector jars fetched at build time
 Python 3.12, uv, confluent-kafka, httpx, pydantic-settings, structlog ·
 Redpanda (Kafka API, schema registry), Redpanda Console · Apache Spark 4.0
 Structured Streaming, Apache Iceberg 1.11, SeaweedFS (S3, Iceberg REST
-catalog), PyIceberg · Docker Compose · pytest, respx, mypy (strict), ruff,
+catalog), PyIceberg · Streamlit, DuckDB, Altair · Docker Compose · pytest, respx, mypy (strict), ruff,
 pre-commit, gitleaks · GitHub Actions.
 
 Event data: [Wikimedia EventStreams](https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams_HTTP_Service).

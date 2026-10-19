@@ -3,9 +3,10 @@
 The recording is produced into Redpanda twice (a producer that crashed and
 resent everything) and the Spark image runs the job over it; then an event
 three days older arrives and the job runs again. PyIceberg reads the tables
-back through the catalog after each run. Everything uses a fresh topic,
-namespace and checkpoint, so it never touches the live tables and can run
-while they stream.
+back through the catalog after each run, and at the end the dashboard is
+rendered over them and its numbers checked against the rows. Everything
+uses a fresh topic, namespace and checkpoint, so it never touches the live
+tables and can run while they stream.
 """
 
 from __future__ import annotations
@@ -19,15 +20,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 from confluent_kafka.admin import AdminClient
 from pyiceberg.catalog import Catalog
+from streamlit.testing.v1 import AppTest
 
 from wikistream.__main__ import build_pipeline
 from wikistream.config import Settings
+from wikistream.dashboard.lake import Lake, naive_utc
+from wikistream.dashboard.queries import compact, percent, signed_bytes
 from wikistream.source import replay
 from wikistream.sse import SseEvent
-from wikistream.streaming.peek import rest_catalog
+from wikistream.streaming.catalog import rest_catalog
 from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
 
 pytestmark = pytest.mark.e2e
@@ -117,6 +122,7 @@ def test_replays_and_late_history_land_once_and_minutes_add_up(run: Run) -> None
     run_job_once(run)
     late_id = json.loads(late.data)["meta"]["id"]
     check_lake(rest_catalog(run.lake), run.namespace, recorded_ids | {late_id})
+    check_dashboard(rest_catalog(run.lake), run.namespace)
 
 
 def check_lake(catalog: Catalog, namespace: str, expected_ids: set[str]) -> None:
@@ -147,3 +153,60 @@ def check_lake(catalog: Catalog, namespace: str, expected_ids: set[str]) -> None
         )
     )
     assert written == expected
+
+
+def dashboard_page(namespace: str, clock: str) -> None:
+    """The real page over the test's tables, run by AppTest."""
+    from datetime import datetime
+
+    from wikistream.dashboard.app import render
+    from wikistream.dashboard.lake import Lake
+    from wikistream.streaming.catalog import rest_catalog
+    from wikistream.streaming.settings import LakeSettings
+
+    render(
+        lambda: Lake(rest_catalog(LakeSettings()), namespace),
+        refresh_seconds=None,
+        now=lambda: datetime.fromisoformat(clock),
+    )
+
+
+def check_dashboard(catalog: Catalog, namespace: str) -> None:
+    """The dashboard's numbers over what Spark wrote, against the same
+    numbers counted straight from the rows."""
+    rows = naive_utc(catalog.load_table(f"{namespace}.{CHANGES}").scan().to_arrow())
+    minutes = [t.replace(second=0) for t in rows["event_time"].to_pylist()]
+    newest = max(minutes)
+    # From the file statistics Spark wrote, not from reading the rows.
+    assert Lake(catalog, namespace).state().newest_minute == newest
+
+    # The page holds the newest minute back as still filling, and the late
+    # event is three days older than a 24-hour window reaches.
+    start = newest - timedelta(hours=24)
+    shown = rows.filter(pa.array([start <= m < newest for m in minutes]))
+    assert 0 < shown.num_rows < rows.num_rows
+
+    app = AppTest.from_function(
+        dashboard_page,
+        kwargs={"namespace": namespace, "clock": (newest + timedelta(minutes=2)).isoformat()},
+        default_timeout=60,
+    )
+    app.query_params["window"] = "24h"
+    app.run()
+    assert not app.exception, app.exception
+    assert "Live" in app.markdown[0].value
+    tiles = {m.label: m.value for m in app.metric}
+
+    def count(column: str, value: object) -> int:
+        return sum(1 for v in shown[column].to_pylist() if v == value)
+
+    covered = len({m for m in minutes if start <= m < newest})
+    deltas = [d for d in shown["length_delta"].to_pylist() if d is not None]
+    assert tiles == {
+        "Changes per minute": compact(shown.num_rows / covered),
+        "Edits": compact(count("type", "edit")),
+        "New pages": compact(count("type", "new")),
+        "Bot share": percent(count("bot", True) / shown.num_rows),
+        "Editors, last hour": compact(len({u for u in shown["user"].to_pylist() if u})),
+        "Content added": signed_bytes(sum(deltas)),
+    }

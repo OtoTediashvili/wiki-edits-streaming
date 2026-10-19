@@ -117,7 +117,8 @@ jobs:
         run: docker compose up -d --wait redpanda seaweedfs
 
       # Produces the recording twice into a fresh topic, runs the job in the
-      # Spark image (`docker compose run spark once`), reads Iceberg back.
+      # Spark image (`docker compose run spark once`), reads Iceberg back,
+      # and renders the dashboard over the result.
       - name: End-to-end test
         run: uv run pytest -m e2e --no-cov
 
@@ -130,17 +131,33 @@ jobs:
         run: docker compose down --volumes
 
   image:
-    name: Producer image builds and starts
+    name: Producer and dashboard images build and start
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
       - name: Build
-        run: docker compose build producer
+        run: docker compose build producer dashboard
 
       # The entrypoint resolves and the package imports inside the image.
-      - name: Smoke test
+      - name: Smoke test the producer
         run: docker run --rm wiki-edits-streaming-producer:dev --help
+
+      # Streamlit serves, and the app imports without Spark (the image has
+      # none). No lake here: the page itself would say so and keep trying.
+      - name: Smoke test the dashboard
+        run: |
+          docker run -d --name dashboard -p 127.0.0.1:8501:8501 wiki-edits-streaming-dashboard:dev
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8501/_stcore/health && exit 0
+            sleep 1
+          done
+          docker logs dashboard
+          exit 1
+
+      - name: Dashboard logs
+        if: failure()
+        run: docker logs dashboard || true
 
   security:
     name: Secret scan

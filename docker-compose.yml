@@ -3,6 +3,7 @@
 #                 and SeaweedFS (S3 + Iceberg REST catalog)
 #   make produce  the producer: live edits into Redpanda
 #   make stream   the Spark job: Redpanda into Iceberg tables
+#   make dashboard  the live dashboard on http://localhost:8501
 #
 # Every port is bound to 127.0.0.1: reachable from this machine, not from the
 # network it's on.
@@ -156,6 +157,35 @@ services:
     # checkpoints. SIGTERM stops the queries cleanly.
     restart: unless-stopped
     stop_grace_period: 60s
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard.Dockerfile
+    image: wiki-edits-streaming-dashboard:dev
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WIKISTREAM_LAKE_CATALOG_URI: http://seaweedfs:8181
+      WIKISTREAM_LAKE_S3_ENDPOINT: http://seaweedfs:8333
+      # Same identity as the seaweedfs service. The dashboard only reads.
+      WIKISTREAM_LAKE_ACCESS_KEY: ${WIKISTREAM_LAKE_ACCESS_KEY:-wikistream}
+      WIKISTREAM_LAKE_SECRET_KEY: ${WIKISTREAM_LAKE_SECRET_KEY:-wikistream-local-secret}
+    ports:
+      - "127.0.0.1:8501:8501"     # the dashboard
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    # Without the lake (SeaweedFS down, no tables yet) the page says so and
+    # keeps checking; it only exits if Streamlit itself fails.
+    restart: unless-stopped
 
 volumes:
   redpanda-data:
