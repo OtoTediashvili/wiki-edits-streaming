@@ -10,9 +10,12 @@ import structlog
 
 def configure_logging(level: str = "INFO", json_logs: bool = False) -> None:
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
-    # httpx logs every request at INFO; the stream is one long request, so
-    # those lines say nothing the producer's own logs don't.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Libraries that log every request at INFO. httpx carries the stream (one
+    # long request); httpx2 carries the schema registry client, whose startup
+    # probe of an API Redpanda doesn't have shows up as a harmless 404. py4j
+    # logs each call between Python and Spark's JVM.
+    for noisy in ("httpx", "httpx2", "py4j"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     renderer: structlog.typing.Processor = (
         structlog.processors.JSONRenderer() if json_logs else structlog.dev.ConsoleRenderer()
     )

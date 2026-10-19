@@ -18,16 +18,24 @@ wikistream = "wikistream.__main__:main"
 dev = [
     "mypy>=2.4",
     "pre-commit>=4",
+    "pyarrow>=20,<26",
+    "pyiceberg[pyarrow]>=0.12,<0.13",
     "pytest>=9.1",
     "pytest-cov>=7",
     "respx>=0.23",
     "ruff>=0.17",
 ]
+spark = [
+    "pyspark==4.0.4",
+]
 
 [tool.uv]
 # uv.lock was written by uv 0.11.32; older versions can't read it. CI and the
-# Dockerfile pin 0.12.24.
+# Dockerfiles pin 0.12.24.
 required-version = ">=0.11.32"
+# `uv sync` installs both groups for development. The images pick what they
+# need: the producer image takes no group, the Spark image only `spark`.
+default-groups = ["dev", "spark"]
 
 [build-system]
 requires = ["hatchling"]
@@ -46,6 +54,10 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "TID", "PTH", "RUF"]
 
+[tool.ruff.lint.pep8-naming]
+# `functions as F`, `types as T`: PySpark's own import convention.
+extend-ignore-names = ["F", "T"]
+
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
 python_version = "3.12"
@@ -53,10 +65,17 @@ strict = true
 files = ["src", "tests"]
 mypy_path = "src"
 
+[[tool.mypy.overrides]]
+# PyArrow ships no type information.
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers --cov=wikistream --cov-report=term-missing --cov-branch"
 markers = [
     "integration: needs a running Redpanda (make up); run with make test-integration",
+    "spark: runs a local Spark (needs Java 17+); everything under tests/streaming",
+    "e2e: the whole stack, Spark job included (make up); run with make test-e2e",
 ]

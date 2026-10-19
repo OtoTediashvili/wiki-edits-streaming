@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
@@ -11,8 +12,8 @@ import pytest
 import respx
 
 from wikistream.config import Settings
-from wikistream.source import EventStream, SourceError, replay
-from wikistream.sse import SseEvent
+from wikistream.source import RESUME_MARGIN_MS, EventStream, SourceError, replay, resume_id
+from wikistream.sse import SseEvent, parse
 
 URL = "https://stream.test/v2/stream/recentchange"
 
@@ -166,3 +167,55 @@ def test_refuses_to_start_without_a_contact(settings: Settings) -> None:
 def test_replay_reads_a_recorded_capture() -> None:
     path = Path(__file__).parent / "fixtures" / "recentchange_sample.sse"
     assert len(list(replay(path))) == 95
+
+
+# Positions as EventStreams writes them: the main datacenter by timestamp, the
+# quiet one still at "-1" because none of its events has arrived yet.
+EQIAD = "eqiad.mediawiki.recentchange"
+CODFW = "codfw.mediawiki.recentchange"
+QUIET_CODFW = (
+    f'[{{"topic":"{EQIAD}","partition":0,"timestamp":1791909668426}},'
+    f'{{"topic":"{CODFW}","partition":0,"offset":-1}}]'
+)
+
+
+def test_a_topic_without_a_position_resumes_with_the_others_not_from_now() -> None:
+    fixed = json.loads(resume_id(QUIET_CODFW))
+    assert fixed == [
+        {"topic": EQIAD, "partition": 0, "timestamp": 1791909668426},
+        {"topic": CODFW, "partition": 0, "timestamp": 1791909668426 - RESUME_MARGIN_MS},
+    ]
+
+
+def test_ids_with_every_position_known_are_sent_unchanged() -> None:
+    both = (
+        f'[{{"topic":"{EQIAD}","partition":0,"timestamp":1791909765967}},'
+        f'{{"topic":"{CODFW}","partition":0,"timestamp":1791909726942}}]'
+    )
+    assert resume_id(both) is both
+    for opaque in (
+        "2",
+        "saved-token",
+        "[]",
+        '{"a": 1}',
+        "[1, 2]",
+        f'[{{"topic":"{CODFW}","offset":-1}}]',
+    ):
+        assert resume_id(opaque) == opaque
+
+
+def test_every_recorded_id_resumes_all_topics() -> None:
+    fixture = Path(__file__).parent / "fixtures" / "recentchange_sample.sse"
+    with fixture.open(encoding="utf-8") as handle:
+        ids = [e.id for e in parse(handle) if e.id]
+    assert sum('"offset":-1' in i for i in ids) > 90  # as recorded: codfw is quiet
+    for i in ids:
+        assert all("timestamp" in p for p in json.loads(resume_id(i)))
+
+
+@respx.mock
+def test_the_header_carries_the_fixed_id(settings: Settings) -> None:
+    route = respx.get(URL).mock(return_value=httpx.Response(200, content=sse_body(("2", "b"))))
+    take(EventStream(settings, sleep=Sleeps()).events(QUIET_CODFW), 1)
+    assert route.calls[0].request.headers["last-event-id"] == resume_id(QUIET_CODFW)
+    assert "-1" not in route.calls[0].request.headers["last-event-id"]

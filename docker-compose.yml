@@ -1,6 +1,8 @@
 # Local stack.
-#   make up       Redpanda (Kafka API + schema registry) and Redpanda Console
-#   make produce  the producer, streaming live edits into Redpanda
+#   make up       Redpanda (Kafka API + schema registry), Redpanda Console,
+#                 and SeaweedFS (S3 + Iceberg REST catalog)
+#   make produce  the producer: live edits into Redpanda
+#   make stream   the Spark job: Redpanda into Iceberg tables
 #
 # Every port is bound to 127.0.0.1: reachable from this machine, not from the
 # network it's on.
@@ -85,6 +87,78 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
 
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    # `mini` is SeaweedFS on one node: object storage with an S3 API, and an
+    # Iceberg REST catalog on top of it. -tableBucket creates the warehouse
+    # bucket on first start. WebDAV and the Lance catalog aren't needed. The
+    # admin UI moves to 12646 because its default puts the admin gRPC port
+    # (UI port + 10000) inside Linux's ephemeral range, where an outgoing
+    # connection can take it first and fail the start.
+    command:
+      - mini
+      - -dir=/data
+      - -tableBucket=lake
+      - -webdav=false
+      - -s3.port.lance=0
+      - -admin.port=12646
+      - -master.telemetry=false
+    environment:
+      # The one identity, allowed everything. Local-stack values; the Spark
+      # job and the tools on this machine use the same defaults.
+      AWS_ACCESS_KEY_ID: ${WIKISTREAM_LAKE_ACCESS_KEY:-wikistream}
+      AWS_SECRET_ACCESS_KEY: ${WIKISTREAM_LAKE_SECRET_KEY:-wikistream-local-secret}
+    ports:
+      - "127.0.0.1:8333:8333"     # S3
+      - "127.0.0.1:8181:8181"     # Iceberg REST catalog
+      - "127.0.0.1:12646:12646"   # admin UI: buckets, Iceberg tables
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  spark:
+    build:
+      context: .
+      dockerfile: spark.Dockerfile
+    image: wiki-edits-streaming-spark:dev
+    command: ["run"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WIKISTREAM_BOOTSTRAP_SERVERS: redpanda:9092
+      WIKISTREAM_LAKE_CATALOG_URI: http://seaweedfs:8181
+      WIKISTREAM_LAKE_S3_ENDPOINT: http://seaweedfs:8333
+      # Same identity as the seaweedfs service above.
+      WIKISTREAM_LAKE_ACCESS_KEY: ${WIKISTREAM_LAKE_ACCESS_KEY:-wikistream}
+      WIKISTREAM_LAKE_SECRET_KEY: ${WIKISTREAM_LAKE_SECRET_KEY:-wikistream-local-secret}
+      # The AWS SDK inside Iceberg otherwise adds checksums to every upload,
+      # which not every S3-compatible store accepts. Only when required.
+      AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+      AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+    ports:
+      - "127.0.0.1:4040:4040"     # Spark UI: queries, batches, state
+    volumes:
+      # Offsets and state for each query. Kept with the tables: deleting one
+      # without the other is what `make reset` is for.
+      - spark-checkpoints:/checkpoints
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    # On a failed query the job exits; the restart resumes from the
+    # checkpoints. SIGTERM stops the queries cleanly.
+    restart: unless-stopped
+    stop_grace_period: 60s
+
 volumes:
   redpanda-data:
   producer-state:
+  seaweedfs-data:
+  spark-checkpoints:

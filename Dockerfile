@@ -17,13 +17,15 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app
 
 # Dependencies first, in their own layer: editing code doesn't reinstall them.
+# --no-default-groups: only the runtime dependencies, without the dev tools
+# and without PySpark, which is the Spark image's business (spark.Dockerfile).
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-default-groups --no-install-project
 
 # Then the project itself, as a regular (non-editable) install, so the runtime
 # stage needs nothing but the venv.
 COPY src ./src
-RUN uv sync --locked --no-dev --no-editable
+RUN uv sync --locked --no-default-groups --no-editable
 
 
 FROM python:3.12-slim

@@ -6,7 +6,7 @@ TOPIC   := wiki.recentchange
 RPK     := docker compose exec -T redpanda rpk
 
 help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
 # ------------------------------------------------------------------ develop
 
@@ -23,26 +23,33 @@ lint: ## Lint without fixing
 typecheck: ## Static type check (strict)
 	uv run mypy
 
-test: ## Unit tests with coverage (no services needed)
-	uv run pytest -m "not integration"
+test: ## Unit tests with coverage (no services; the Spark ones need Java 17+)
+	uv run pytest -m "not integration and not e2e"
 
 test-integration: ## Round trip through the real Redpanda (needs make up)
 	uv run pytest -m integration --no-cov
+
+test-e2e: ## Recording -> Redpanda -> Spark -> Iceberg, checked with PyIceberg (needs make up)
+	docker compose build spark
+	uv run pytest -m e2e --no-cov
 
 check: lint typecheck test ## Everything CI's quality job runs
 
 # ------------------------------------------------------------------ stack
 
-up: ## Start Redpanda and Console (http://localhost:8090)
-	docker compose up -d --wait redpanda console
-	@echo "Console: http://localhost:8090   Kafka: localhost:19092   Schema registry: http://localhost:18081"
+up: ## Start Redpanda, Console and SeaweedFS (S3 + Iceberg catalog)
+	docker compose up -d --wait redpanda console seaweedfs
+	@echo "Console:          http://localhost:8090"
+	@echo "SeaweedFS admin:  http://localhost:12646"
+	@echo "Kafka: localhost:19092   Schema registry: http://localhost:18081"
+	@echo "Iceberg catalog: http://localhost:8181   S3: http://localhost:8333"
 
-down: ## Stop everything (topics and resume position are kept)
+down: ## Stop everything (topics, tables, checkpoints and resume position are kept)
 	docker compose down
 
-reset: ## Stop everything and delete all topic data and the resume position
+reset: ## Stop everything and delete ALL data: topics, tables, checkpoints, position
 	docker compose down --volumes
-	rm -rf data/state
+	rm -rf data/state data/checkpoints
 
 ps: ## What is running
 	docker compose ps
@@ -64,6 +71,26 @@ logs: ## Follow the producer's logs
 replay: ## Send the recorded 95-event capture into Redpanda (from this machine)
 	uv run wikistream replay $(FIXTURE)
 
+# ------------------------------------------------------------------ stream
+
+stream: ## Run the Spark job: Redpanda into Iceberg (builds the image; UI on :4040)
+	docker compose up -d --build spark
+	@echo "Spark job started. Follow it with: make stream-logs   Spark UI: http://localhost:4040"
+
+stream-stop: ## Stop the Spark job (it resumes from its checkpoints next time)
+	docker compose stop spark
+
+stream-logs: ## Follow the Spark job's logs
+	docker compose logs -f spark
+
+peek: ## Table sizes and the newest minutes, read from Iceberg
+	uv run python -m wikistream.streaming.peek
+
+lake-reset: ## Delete the Iceberg tables and the job's checkpoint; keeps Redpanda's topics
+	docker compose rm --stop --force spark seaweedfs
+	docker volume rm --force wiki-edits-streaming_seaweedfs-data wiki-edits-streaming_spark-checkpoints
+	@echo "Lake emptied. make up, then make stream rebuilds it from what Redpanda holds (48 h)."
+
 # ------------------------------------------------------------------ inspect
 
 topics: ## List topics with partitions and retention
@@ -80,5 +107,5 @@ partitions: ## Messages per partition: offsets and leaders
 clean: ## Remove local caches and the venv
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov coverage.xml
 
-.PHONY: help install fmt lint typecheck test test-integration check up down reset ps \
-	produce stop logs replay topics consume partitions clean
+.PHONY: help install fmt lint typecheck test test-integration test-e2e check up down reset ps \
+	produce stop logs replay stream stream-stop stream-logs peek lake-reset topics consume partitions clean

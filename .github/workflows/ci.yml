@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 # Runners are pinned, not ubuntu-latest, so an image change is a commit here
-# rather than a surprise. uv is pinned to the version in the Dockerfile.
+# rather than a surprise. uv is pinned to the version in the Dockerfiles.
 env:
   UV_VERSION: "0.12.24"
   GITLEAKS_VERSION: "8.23.3"
@@ -23,11 +23,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # This job owns the uv cache; the others only restore it. Several jobs
+      # saving the same key at once is what produced "Unable to reserve cache".
       - uses: astral-sh/setup-uv@v7
         with:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+
+      # The Spark tests start a local Spark: Java 21, preinstalled on the
+      # runner image, the same major version as the Spark image.
+      - name: Use Java 21
+        run: echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
 
       # --locked: fail if uv.lock is out of date with pyproject.toml,
       # instead of quietly resolving something else than developers run.
@@ -44,7 +51,7 @@ jobs:
         run: uv run mypy
 
       - name: Pytest
-        run: uv run pytest -m "not integration" --cov-report=xml
+        run: uv run pytest -m "not integration and not e2e" --cov-report=xml
 
       - name: Upload coverage
         uses: actions/upload-artifact@v6
@@ -66,6 +73,7 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+          save-cache: false
 
       - name: Install from the lockfile
         run: uv sync --locked
@@ -83,6 +91,41 @@ jobs:
         run: docker compose logs redpanda
 
       - name: Stop Redpanda
+        if: always()
+        run: docker compose down --volumes
+
+  e2e:
+    name: Recording through Spark into Iceberg
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+          save-cache: false
+
+      - name: Install from the lockfile
+        run: uv sync --locked
+
+      - name: Build the Spark image
+        run: docker compose build spark
+
+      - name: Start Redpanda and SeaweedFS
+        run: docker compose up -d --wait redpanda seaweedfs
+
+      # Produces the recording twice into a fresh topic, runs the job in the
+      # Spark image (`docker compose run spark once`), reads Iceberg back.
+      - name: End-to-end test
+        run: uv run pytest -m e2e --no-cov
+
+      - name: Service logs
+        if: failure()
+        run: docker compose logs redpanda seaweedfs
+
+      - name: Stop the stack
         if: always()
         run: docker compose down --volumes
 
