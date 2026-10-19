@@ -125,11 +125,11 @@ def test_live_page_with_numbers_charts_and_tables(tmp_path: Path, cat: Catalog) 
     assert [h.value for h in app.subheader] == [
         "Changes per minute",
         "Busiest wikis",
-        "Most edited pages",
+        "Pages with the most editors",
         "Newest articles",
     ]
     pages, articles = app.dataframe[0].value, app.dataframe[1].value
-    assert "Edits by people, last hour. Bots are left out." in text(app)
+    assert "How many people edited each page, last hour. Bots are left out." in text(app)
     assert list(pages["title"]) == ["Ada Lovelace", "Brand new article"]
     assert list(pages["editors"]) == [2, 1]
     assert list(articles["url"]) == ["https://en.wikipedia.org/wiki/Brand_new_article"]

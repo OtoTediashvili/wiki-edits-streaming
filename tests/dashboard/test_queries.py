@@ -111,27 +111,32 @@ def test_the_wiki_list_ignores_the_wiki_filter() -> None:
     assert numbers(MINUTES, wiki="enwiki").wikis() == [("commonswiki", 350), ("enwiki", 60)]
 
 
-def test_busiest_pages_by_people_with_links() -> None:
+def test_pages_with_the_most_editors_with_links() -> None:
     edits = [
+        # One person running a tool: many edits, one editor. Not flagged as a bot.
+        *[
+            change(at(0), title="Q42", wiki="wikidatawiki", user="Tool user",
+                   server_name="www.wikidata.org")
+            for _ in range(9)
+        ],
         *[change(at(0), title="Ada Lovelace", user="A") for _ in range(3)],
         *[change(at(1), title="Zürich", user=u) for u in ("B", "C", "B")],
         change(at(1), title="Talk:Ada Lovelace", user="A", namespace=1),
         *[
-            change(
-                at(2), title="Q42", wiki="wikidatawiki", user="Bot", bot=True,
-                server_name="www.wikidata.org",
-            )
-            for _ in range(9)
+            change(at(2), title="Q64", wiki="wikidatawiki", user="Bot", bot=True,
+                   server_name="www.wikidata.org")
+            for _ in range(20)
         ],
         *[change(at(2), title="Zürich", user="D", type=kind) for kind in ("log", "categorize")],
     ]  # fmt: skip
     pages = numbers(MINUTES, edits).busiest_pages()
-    # 3 edits each: more editors ranks first, whatever the alphabet says.
-    assert list(pages["title"]) == ["Zürich", "Ada Lovelace", "Talk:Ada Lovelace"]
-    assert list(pages["edits"]) == [3, 3, 1]  # the bot's 9 edits and log entries don't count
-    assert list(pages["editors"]) == [2, 1, 1]
+    # Two people editing a page beats one person's 9 edits; then edits count.
+    assert list(pages["title"]) == ["Zürich", "Q42", "Ada Lovelace", "Talk:Ada Lovelace"]
+    assert list(pages["editors"]) == [2, 1, 1, 1]
+    assert list(pages["edits"]) == [3, 9, 3, 1]  # no bot edits, no log entries
     assert list(pages["url"]) == [
         "https://en.wikipedia.org/wiki/Z%C3%BCrich",
+        "https://www.wikidata.org/wiki/Q42",
         "https://en.wikipedia.org/wiki/Ada_Lovelace",
         "https://en.wikipedia.org/wiki/Talk:Ada_Lovelace",
     ]

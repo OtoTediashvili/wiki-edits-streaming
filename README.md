@@ -17,6 +17,8 @@ flowchart LR
     L -->|PyIceberg + DuckDB| D[Live dashboard<br/>Streamlit]
 ```
 
+![The dashboard on live data: status, six numbers for the last hour, changes per minute by people and bots, the busiest wikis](docs/dashboard.png)
+
 **Status:** ingestion, the stream job and the live dashboard are done, with
 unit, integration and end-to-end tests in CI. Table maintenance (compaction,
 snapshot expiry) comes next.
@@ -168,7 +170,8 @@ seconds, and writes nothing.
 - **Changes per minute,** people and bots, with a crosshair and the exact
   numbers on hover.
 - **The busiest wikis,** split into people and bots.
-- **The most edited pages and the newest articles,** with links to them.
+- **The pages the most people are editing, and the newest pages,** with
+  links to them.
 
 A window (15 minutes to 24 hours) and a wiki can be picked, and both go into
 the URL, so `?window=6h&wiki=dewiki` is a link to that view.
@@ -201,6 +204,13 @@ then showed 06:18 on the axis for 10:18 UTC. Times without a zone reach the
 chart as the viewer's local time, so they now go out as UTC instants on a
 UTC scale, and a test checks the serialized chart. The same session found
 that one theme setting had switched off dark mode.
+
+The first hour of real data found the next one. The "most edited pages"
+were Wikidata items with up to 101 edits each, every one by a single
+person running a tool: semi-automated tools aren't flagged as bots, so
+leaving bots out didn't catch them. Pages are now ranked by how many
+different people edited them, which brings up what people are actually
+working on.
 
 ## Run it
 
@@ -271,7 +281,8 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   time ranges, reading one range from the oldest event to the newest,
   swapping bots and humans; and on the dashboard, counting the minute still
   filling, adding up editors instead of counting distinct ones, reading
-  every file and filtering afterwards, letting bots into the busiest pages,
+  every file and filtering afterwards, letting bots into the page list,
+  ranking one person's tool run above a page several people are editing,
   sending chart times without a zone. Each break fails a test.
 
 CI runs all of it: lint, strict mypy, unit tests, the integration and

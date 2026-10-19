@@ -188,10 +188,13 @@ class Numbers:
         )
 
     def busiest_pages(self, n: int = 10) -> pd.DataFrame:
-        """wiki, title, edits, editors, url: the pages people edited most.
+        """wiki, title, editors, edits, url: the pages the most people edited.
 
-        Bots are left out: they edit thousands of pages a few times each,
-        and would fill the list with Wikidata items."""
+        Ranked by distinct editors, then edits. By edits alone, the first
+        hour of real data put a Wikidata item on top with 101 edits, all by
+        one person running a tool; semi-automated tools aren't flagged as
+        bots. Pages several people are editing are what's happening. Bots
+        are left out for the same reason."""
         frame = self._frame(
             """
             SELECT wiki, server_name, title,
@@ -200,7 +203,7 @@ class Numbers:
             FROM changes
             WHERE type IN ('edit', 'new') AND NOT coalesce(bot, false)
             GROUP BY wiki, server_name, title
-            ORDER BY edits DESC, editors DESC, wiki, title
+            ORDER BY editors DESC, edits DESC, wiki, title
             LIMIT $n
             """,
             n=n,
@@ -208,8 +211,9 @@ class Numbers:
         return _with_urls(frame)
 
     def newest_articles(self, n: int = 10) -> pd.DataFrame:
-        """time, wiki, title, bytes, url: the latest articles people created
-        (namespace 0, so no talk, user or file pages)."""
+        """time, wiki, title, bytes, url: the latest pages people created in
+        a wiki's main namespace (0): articles, dictionary entries, Wikidata
+        items; no talk, user or file pages."""
         frame = self._frame(
             """
             SELECT event_time AS time, wiki, server_name, title, length_new AS bytes

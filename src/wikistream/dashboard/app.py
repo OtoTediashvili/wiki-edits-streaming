@@ -321,12 +321,15 @@ def _live(
     else:
         pages = st.container()
     with pages:
-        st.subheader("Most edited pages")
-        st.caption(f"Edits by people, {since}. Bots are left out.")
+        st.subheader("Pages with the most editors")
+        st.caption(f"How many people edited each page, {since}. Bots are left out.")
         _pages_table(numbers.busiest_pages())
 
     st.subheader("Newest articles")
-    st.caption(f"Articles people created, {since}, newest first.")
+    st.caption(
+        f"Pages people created in each wiki's main namespace (articles, dictionary "
+        f"entries, Wikidata items), {since}, newest first."
+    )
     _articles_table(numbers.newest_articles())
 
 
@@ -391,7 +394,7 @@ def _pages_table(pages: pd.DataFrame) -> None:
         pages,
         hide_index=True,
         width="stretch",
-        column_order=["wiki", "title", "edits", "editors", "url"],
+        column_order=["wiki", "title", "editors", "edits", "url"],
         column_config={
             "wiki": st.column_config.TextColumn("Wiki"),
             "title": st.column_config.TextColumn("Page"),
