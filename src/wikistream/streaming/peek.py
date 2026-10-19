@@ -1,32 +1,90 @@
 """Look into the lake from this machine, without Spark: `make peek`.
 
 Reads the tables through the same REST catalog with PyIceberg, like the
-dashboard does.
+dashboard does. For each table: rows and files now, snapshots kept, and
+what it takes on disk, which is what maintenance (`make maintain`) brings
+down.
 """
 
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 import pyarrow as pa
+from pyarrow.fs import FileSelector, FileType
 from pyiceberg.catalog import Catalog
+from pyiceberg.io.pyarrow import PyArrowFileIO
+from pyiceberg.table import Table
 
 from wikistream.streaming.catalog import rest_catalog
 from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
 
 
-def _table_summary(catalog: Catalog, identifier: str) -> str:
-    table = catalog.load_table(identifier)
+@dataclass(frozen=True)
+class Footprint:
+    """A table as it is (the current snapshot) and as it sits on disk (every
+    object under its location: data files old snapshots still hold, files no
+    snapshot holds, and metadata)."""
+
+    rows: int
+    data_files: int
+    data_bytes: int
+    snapshots: int
+    oldest_snapshot: datetime | None
+    disk_objects: int
+    disk_bytes: int
+
+
+def footprint(table: Table) -> Footprint:
     snapshot = table.current_snapshot()
-    if snapshot is None:
+    totals = snapshot.summary.additional_properties if snapshot and snapshot.summary else {}
+    snapshots = table.metadata.snapshots
+    oldest = min((s.timestamp_ms for s in snapshots), default=None)
+    location = urlparse(table.location())
+    if not isinstance(table.io, PyArrowFileIO):
+        raise TypeError(f"can't list {table.location()} with {type(table.io).__name__}")
+    fs = table.io.fs_by_scheme(location.scheme, location.netloc)
+    listing = fs.get_file_info(FileSelector(f"{location.netloc}{location.path}", recursive=True))
+    objects = [info for info in listing if info.type == FileType.File]
+    return Footprint(
+        rows=int(totals.get("total-records", 0)),
+        data_files=int(totals.get("total-data-files", 0)),
+        data_bytes=int(totals.get("total-files-size", 0)),
+        snapshots=len(snapshots),
+        oldest_snapshot=datetime.fromtimestamp(oldest / 1000, UTC) if oldest else None,
+        disk_objects=len(objects),
+        disk_bytes=sum(info.size for info in objects),
+    )
+
+
+def _size(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return f"{size:,.0f} {unit}" if unit == "B" else f"{size:,.1f} {unit}"
+        size /= 1000
+    raise AssertionError("unreachable")
+
+
+def _n(count: int, noun: str) -> str:
+    return f"{count:,} {noun}" + ("" if count == 1 else "s")
+
+
+def describe(identifier: str, table: Footprint, now: datetime) -> str:
+    if table.snapshots == 0:
         return f"{identifier}: empty"
-    summary = snapshot.summary.additional_properties if snapshot.summary else {}
-    committed = datetime.fromtimestamp(snapshot.timestamp_ms / 1000, UTC)
+    average = table.data_bytes / table.data_files if table.data_files else 0
+    oldest = table.oldest_snapshot
+    age = f", the oldest {(now - oldest).total_seconds() / 3600:.1f} h old" if oldest else ""
+    held = table.disk_bytes - table.data_bytes
     return (
-        f"{identifier}: {int(summary.get('total-records', 0)):,} rows in "
-        f"{int(summary.get('total-data-files', 0)):,} files, "
-        f"{len(table.metadata.snapshots)} snapshots, last commit {committed:%H:%M:%S} UTC"
+        f"{identifier}: {_n(table.rows, 'row')} in {_n(table.data_files, 'file')} "
+        f"({_size(table.data_bytes)}, {_size(average)} each on average)\n"
+        f"  {_n(table.snapshots, 'snapshot')}{age}\n"
+        f"  on disk: {_size(table.disk_bytes)} in {_n(table.disk_objects, 'object')}; "
+        f"{_size(held)} of it is metadata and files only old snapshots hold"
     )
 
 
@@ -59,8 +117,10 @@ def main() -> int:
     settings = LakeSettings()
     catalog = rest_catalog(settings)
     namespace = settings.lake_namespace
+    now = datetime.now(UTC)
     for name in (CHANGES, EDITS_PER_MINUTE):
-        print(_table_summary(catalog, f"{namespace}.{name}"))
+        identifier = f"{namespace}.{name}"
+        print(describe(identifier, footprint(catalog.load_table(identifier)), now))
     newest = _newest_minutes(catalog, f"{namespace}.{EDITS_PER_MINUTE}")
     if newest.num_rows == 0:
         print("\nNo minutes counted yet.")

@@ -52,6 +52,16 @@ class LakeSettings(BaseSettings):
     # snapshot each, plus a few small files); a minute keeps that modest.
     trigger_seconds: int = Field(default=60, ge=1)
 
+    # --- maintenance (maintenance.py) -----------------------------------------
+    # How often the running job compacts and expires snapshots. 0 leaves it
+    # to `make maintain`.
+    maintenance_every_minutes: int = Field(default=60, ge=0)
+    # Snapshots younger than this are kept, so a table can still be read as
+    # it was this morning...
+    snapshot_retention_hours: float = Field(default=6, ge=0)
+    # ...and at least this many, however old.
+    snapshot_retain_last: int = Field(default=10, ge=1)
+
     # --- Spark --------------------------------------------------------------
     spark_driver_memory: str = "1g"
     # Where the connector jars are cached. The Spark image downloads them at

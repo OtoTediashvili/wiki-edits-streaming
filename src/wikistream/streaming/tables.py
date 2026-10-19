@@ -28,7 +28,7 @@ TABLE_PROPERTIES = {
 }
 
 
-def _quote(text: str) -> str:
+def sql_string(text: str) -> str:
     return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
@@ -51,13 +51,13 @@ def create_table_sql(
             f"{table}: partition column {source.group(1)!r} is the first column; "
             "SeaweedFS's catalog rejects that (source id 0). Put another column first."
         )
-    cols = ",\n  ".join(f"`{c.name}` {c.sql_type} COMMENT {_quote(c.comment)}" for c in columns)
-    props = ",\n  ".join(f"{_quote(k)} = {_quote(v)}" for k, v in TABLE_PROPERTIES.items())
+    cols = ",\n  ".join(f"`{c.name}` {c.sql_type} COMMENT {sql_string(c.comment)}" for c in columns)
+    props = ",\n  ".join(f"{sql_string(k)} = {sql_string(v)}" for k, v in TABLE_PROPERTIES.items())
     return (
         f"CREATE TABLE IF NOT EXISTS {table} (\n  {cols}\n)\n"
         f"USING iceberg\n"
         f"PARTITIONED BY ({partition_by})\n"
-        f"COMMENT {_quote(comment)}\n"
+        f"COMMENT {sql_string(comment)}\n"
         f"TBLPROPERTIES (\n  {props}\n)"
     )
 
@@ -95,7 +95,7 @@ _NOT_READY = (
 )
 
 
-def _cause(exc: Exception) -> str:
+def java_cause(exc: Exception) -> str:
     """The Java exception behind a Py4J error, in one line: py4j's own first
     line ("An error occurred while calling o76.sql.") says nothing."""
     lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
@@ -118,7 +118,7 @@ def ensure_tables(
             for statement in ddl(settings):
                 spark.sql(statement)
         except Exception as exc:
-            cause = _cause(exc)
+            cause = java_cause(exc)
             if attempt == attempts or not any(sign in cause for sign in _NOT_READY):
                 log.error("tables.failed", attempt=attempt, error=cause)
                 raise

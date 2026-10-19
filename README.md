@@ -20,8 +20,8 @@ flowchart LR
 ![The dashboard on live data: status, six numbers for the last hour, changes per minute by people and bots, the busiest wikis](docs/dashboard.png)
 
 **Status:** ingestion, the stream job and the live dashboard are done, with
-unit, integration and end-to-end tests in CI. Table maintenance (compaction,
-snapshot expiry) comes next.
+unit, integration and end-to-end tests in CI, and the tables maintain
+themselves (compaction, snapshot expiry).
 
 ## The data, measured
 
@@ -212,6 +212,60 @@ leaving bots out didn't catch them. Pages are now ranked by how many
 different people edited them, which brings up what people are actually
 working on.
 
+## Keeping the tables healthy
+
+A streaming job that commits every minute leaves things behind, and on a
+laptop disk they add up:
+
+- **Small files.** `changes` gets one data file per batch, about 1,440 a
+  day. Every reader opens each of them, one S3 request apiece.
+- **Superseded versions.** `edits_per_minute` is copy-on-write: each MERGE
+  rewrites the data file holding today's minutes. The table stays at about
+  one file a day, but every version it replaced stays on disk while any
+  snapshot still points to it.
+- **Snapshots.** One per commit per table, each listed in the metadata file
+  that every commit and every reader loads.
+
+`make peek` shows all three for each table: rows and files now, how many
+snapshots are kept and how old the oldest is, and what the table takes on
+disk against what the current snapshot needs.
+
+**What runs.** Iceberg's own Spark procedures, once an hour inside the
+stream job (between its batches, in the same Spark session, so no second
+JVM), and on demand with `make maintain`:
+
+1. `rewrite_data_files` on `changes`, for the days that have ended (UTC):
+   the day's small files become one or two of up to 128 MB. Only days with
+   five or more small files qualify, so a late event added to a compacted
+   day doesn't trigger rewriting the whole day.
+2. `expire_snapshots` on both tables: snapshots older than six hours go
+   (the last ten always stay), and with them every data, manifest and
+   manifest-list file only they referenced.
+
+**Why it can run while the job writes.** Iceberg commits are optimistic:
+two writers conflict only if one changes files the other depends on.
+Compaction touches only days that have ended, and the job only appends to
+`changes`, so rewriting yesterday and appending today never conflict.
+The minute table, which the job rewrites, is never compacted. Expiry only
+removes snapshots nothing reads any more. And one task failing (say a
+compaction that lost a race with a straggler's commit) is logged, and the
+others still run.
+
+**What it leaves alone.** Orphan files, written by a batch that crashed
+before it committed. Removing them means listing the warehouse through a
+Hadoop file system the Spark image doesn't have. With idempotent batches
+they are rare, and `make peek`'s disk figure includes them.
+
+**How it's tested.** The end-to-end test runs the job in small batches, so
+the recorded day lands as many small files. It then runs `maintain` in
+the Spark image, with every snapshot but the last old enough to expire,
+and checks the result: the day is one file, one snapshot is left, there
+are fewer objects and fewer bytes on disk, the rows are the same, and
+every lake and dashboard check passes unchanged. Unit tests cover what
+each run does, that Spark's parser accepts every call, that a failed task
+doesn't stop the rest, and that the hourly schedule can't take the stream
+job down.
+
 ## Run it
 
 Needs Docker, [uv](https://docs.astral.sh/uv/) 0.11.32 or newer, make, and
@@ -226,7 +280,8 @@ make up                   # Redpanda, Console (:8090), SeaweedFS (admin UI :1264
 make produce              # stream live edits; make logs to follow, make stop to stop
 make stream               # the Spark job; make stream-logs, Spark UI on :4040
 make dashboard            # the live dashboard on :8501
-make peek                 # table sizes and the newest minutes, in the terminal
+make peek                 # table sizes, disk use and the newest minutes, in the terminal
+make maintain             # compact and expire snapshots now (the job also does it hourly)
 
 make test-integration     # producer -> Redpanda -> consumer
 make test-e2e             # recording -> Redpanda -> Spark -> Iceberg, read back
@@ -243,7 +298,7 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 
 ## Tests
 
-- **154 unit tests** (`make test`), no network or Docker:
+- **166 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the
@@ -262,7 +317,10 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
     reads that open only the files in the window, freshness from metadata
     alone, and the whole page run headless with Streamlit's AppTest, live,
     catching up, stalled, before any table exists and with the catalog
-    down.
+    down;
+  - maintenance: what each run does, Spark's parser over every procedure
+    call, a failed task not stopping the rest, the hourly schedule, and
+    `make peek`'s disk figures on tables with superseded files.
 - **Integration tests** (`make test-integration`): the recording goes through
   the real producer, Redpanda and schema registry and is read back by a
   consumer; topic retention and repeatable topic creation are checked.
@@ -272,7 +330,8 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   PyIceberg reads the tables back: every event exactly once, and per-minute
   counts that agree with the rows. Then the dashboard is rendered over what
   Spark wrote, and each of its numbers is checked against the same number
-  counted from the rows.
+  counted from the rows. Last, maintenance runs in the Spark image, and the
+  same checks pass on fewer files and less disk.
 - The tests were checked by breaking the code on purpose: forgetting the
   resume id, resuming a datacenter from "now", retrying a 4xx, saving the position before the broker confirms,
   keeping canaries, skipping schema validation, not checking which events
@@ -283,7 +342,9 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   filling, adding up editors instead of counting distinct ones, reading
   every file and filtering afterwards, letting bots into the page list,
   ranking one person's tool run above a page several people are editing,
-  sending chart times without a zone. Each break fails a test.
+  sending chart times without a zone; and in maintenance, compacting
+  today, expiring without keeping the last snapshots, letting one failed
+  task stop the rest. Each break fails a test.
 
 CI runs all of it: lint, strict mypy, unit tests, the integration and
 end-to-end tests against the same `docker-compose.yml`, all three image
@@ -305,8 +366,9 @@ src/wikistream/
     tables.py         Iceberg DDL, generated from the column specs
     session.py        Spark configuration: connectors, catalog, logging
     job.py            the batch writer, the query, supervision, progress logging
+    maintenance.py    compaction and snapshot expiry, hourly and on demand
     catalog.py        the REST catalog for Python readers (PyIceberg)
-    peek.py           read the tables from the host with PyIceberg
+    peek.py           read the tables from the host with PyIceberg: sizes, disk use
   dashboard/
     lake.py           what the page reads: time-bounded scans, freshness from metadata
     queries.py        every number on the page, as DuckDB SQL over Arrow

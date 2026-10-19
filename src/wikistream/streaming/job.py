@@ -270,11 +270,15 @@ def await_queries(
     queries: list[StreamingQuery],
     poll_seconds: float = 2.0,
     sleep: Callable[[float], None] = time.sleep,
+    on_tick: Callable[[], None] | None = None,
 ) -> None:
     """Block until every query has finished. If one fails, stop the rest and
-    raise, so the container exits and restarts from the checkpoint."""
+    raise, so the container exits and restarts from the checkpoint.
+    `on_tick` runs once per poll while the queries run (table maintenance)."""
     try:
         while any(q.isActive for q in queries):
+            if on_tick is not None:
+                on_tick()
             for q in queries:
                 if not q.isActive and q.exception() is not None:
                     raise RuntimeError(f"query {q.name} failed: {q.exception()}")

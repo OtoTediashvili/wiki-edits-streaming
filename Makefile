@@ -86,6 +86,9 @@ stream-logs: ## Follow the Spark job's logs
 peek: ## Table sizes and the newest minutes, read from Iceberg
 	uv run python -m wikistream.streaming.peek
 
+maintain: ## Compact the days that ended and expire old snapshots, now (the job also does it hourly)
+	docker compose run --rm -T spark maintain
+
 lake-reset: ## Delete the Iceberg tables and the job's checkpoint; keeps Redpanda's topics
 	docker compose rm --stop --force spark seaweedfs
 	docker volume rm --force wiki-edits-streaming_seaweedfs-data wiki-edits-streaming_spark-checkpoints
@@ -123,5 +126,5 @@ clean: ## Remove local caches and the venv
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov coverage.xml
 
 .PHONY: help install fmt lint typecheck test test-integration test-e2e check up down reset ps \
-	produce stop logs replay stream stream-stop stream-logs peek lake-reset \
+	produce stop logs replay stream stream-stop stream-logs peek maintain lake-reset \
 	dashboard dashboard-stop dashboard-logs dashboard-dev topics consume partitions clean

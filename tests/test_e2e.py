@@ -1,12 +1,14 @@
 """The whole pipeline, against the real stack: `make up`, then `make test-e2e`.
 
 The recording is produced into Redpanda twice (a producer that crashed and
-resent everything) and the Spark image runs the job over it; then an event
-three days older arrives and the job runs again. PyIceberg reads the tables
-back through the catalog after each run, and at the end the dashboard is
-rendered over them and its numbers checked against the rows. Everything
-uses a fresh topic, namespace and checkpoint, so it never touches the live
-tables and can run while they stream.
+resent everything) and the Spark image runs the job over it, in small
+batches; then an event three days older arrives and the job runs again.
+PyIceberg reads the tables back through the catalog after each run, and the
+dashboard is rendered over them and its numbers checked against the rows.
+Last, table maintenance runs in the Spark image and everything is checked
+again: the same data in fewer files, on less disk. Everything uses a fresh
+topic, namespace and checkpoint, so it never touches the live tables and can
+run while they stream.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from wikistream.dashboard.queries import compact, percent, signed_bytes
 from wikistream.source import replay
 from wikistream.sse import SseEvent
 from wikistream.streaming.catalog import rest_catalog
+from wikistream.streaming.peek import footprint
 from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
 
 pytestmark = pytest.mark.e2e
@@ -89,16 +92,19 @@ def days_earlier(last: SseEvent, days: int) -> SseEvent:
     return SseEvent("message", json.dumps(event), None)
 
 
-def run_job_once(run: Run) -> None:
+def run_spark(run: Run, command: str, **extra_env: str) -> None:
+    """A command of the Spark image, against this test's topic and tables.
+    check=True: `maintain` exits non-zero if any procedure failed."""
     env = {
         "WIKISTREAM_TOPIC": run.topic,
         "WIKISTREAM_LAKE_NAMESPACE": run.namespace,
         # Its own checkpoint, kept between this test's runs of the job.
         "WIKISTREAM_CHECKPOINT_DIR": run.checkpoint_dir,
+        **extra_env,
     }
     flags = [arg for key, value in env.items() for arg in ("-e", f"{key}={value}")]
     subprocess.run(
-        ["docker", "compose", "run", "--rm", "-T", *flags, "spark", "once"],
+        ["docker", "compose", "run", "--rm", "-T", *flags, "spark", command],
         cwd=REPO,
         check=True,
         timeout=900,
@@ -112,17 +118,43 @@ def test_replays_and_late_history_land_once_and_minutes_add_up(run: Run) -> None
     # A producer that crashed and resent everything: 190 messages, 95 events.
     for _ in range(2):
         assert build_pipeline(run.producer, None).run(iter(recorded)).produced == 95
-    run_job_once(run)
+    # Small batches, like a day of live traffic: one small file each.
+    run_spark(run, "once", WIKISTREAM_MAX_OFFSETS_PER_TRIGGER="10")
     check_lake(rest_catalog(run.lake), run.namespace, recorded_ids)
 
     # Then an event three days older than anything processed so far. A
     # watermark-based job drops it as late; this one must write it.
     late = days_earlier(recorded[-1], days=3)
     assert build_pipeline(run.producer, None).run(iter([late])).produced == 1
-    run_job_once(run)
+    run_spark(run, "once")
     late_id = json.loads(late.data)["meta"]["id"]
     check_lake(rest_catalog(run.lake), run.namespace, recorded_ids | {late_id})
     check_dashboard(rest_catalog(run.lake), run.namespace)
+
+    # Maintenance, with every snapshot but the last old enough to expire.
+    catalog = rest_catalog(run.lake)
+    tables = {name: f"{run.namespace}.{name}" for name in (CHANGES, EDITS_PER_MINUTE)}
+    before = {name: footprint(catalog.load_table(t)) for name, t in tables.items()}
+    assert before[CHANGES].data_files >= 6  # the recorded day in small files, and the late one
+    run_spark(
+        run,
+        "maintain",
+        WIKISTREAM_SNAPSHOT_RETENTION_HOURS="0",
+        WIKISTREAM_SNAPSHOT_RETAIN_LAST="1",
+    )
+    catalog = rest_catalog(run.lake)
+    after = {name: footprint(catalog.load_table(t)) for name, t in tables.items()}
+    # The recorded day compacted to one file; the late event's day, a single
+    # file already, left as it was.
+    assert after[CHANGES].data_files == 2
+    for name in tables:
+        assert after[name].snapshots == 1
+        assert after[name].rows == before[name].rows
+        assert after[name].disk_objects < before[name].disk_objects
+        assert after[name].disk_bytes < before[name].disk_bytes
+    # And nothing a reader sees has changed.
+    check_lake(catalog, run.namespace, recorded_ids | {late_id})
+    check_dashboard(catalog, run.namespace)
 
 
 def check_lake(catalog: Catalog, namespace: str, expected_ids: set[str]) -> None:

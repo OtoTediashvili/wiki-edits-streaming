@@ -77,6 +77,19 @@ def test_ctrl_c_stops_both() -> None:
     assert a.stopped and b.stopped
 
 
+def test_maintenance_gets_a_tick_every_poll_while_the_queries_run() -> None:
+    clock = Clock()
+    ticks: list[int] = []
+    query = FakeQuery(clock, "lake", ends_after=3)
+    await_queries(
+        cast(list[StreamingQuery], [query]),
+        poll_seconds=0,
+        sleep=clock.sleep,
+        on_tick=lambda: ticks.append(clock.ticks),
+    )
+    assert ticks == [0, 1, 2]
+
+
 def test_progress_line_reports_rows_rate_and_lag() -> None:
     progress = SimpleNamespace(
         name="lake",
