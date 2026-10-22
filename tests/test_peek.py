@@ -32,15 +32,33 @@ def test_old_snapshots_keep_superseded_files_on_disk(tmp_path: Path) -> None:
     assert stats.disk_objects > len(parquet)
     assert stats.disk_bytes > stats.data_bytes > 0
 
+    assert stats.files_by_day == {T0.date(): 1}
     text = describe("wiki.edits_per_minute", stats, now + timedelta(hours=2))
     assert text.startswith("wiki.edits_per_minute: 1 row in 1 file (")
     assert "6 snapshots, the oldest 2.0 h old" in text
     assert f"in {stats.disk_objects:,} objects" in text
 
 
+def test_files_are_counted_by_day_so_compaction_shows(tmp_path: Path) -> None:
+    table = create_tables(tmp_path).load_table(f"{NAMESPACE}.{EDITS_PER_MINUTE}")
+    for day, files in ((0, 3), (1, 1), (9, 2)):
+        for i in range(files):
+            start = T0 - timedelta(days=day, minutes=i)
+            table.append(arrow(MINUTE_COLUMNS, [minute("enwiki", start, humans=1)]))
+    stats = footprint(table)
+    assert stats.files_by_day == {
+        T0.date(): 3,
+        (T0 - timedelta(days=1)).date(): 1,
+        (T0 - timedelta(days=9)).date(): 2,
+    }
+    text = describe("wiki.edits_per_minute", stats, datetime.combine(T0.date(), T0.time(), UTC))
+    assert "files: 3 today (UTC), 3 files across 2 other days" in text
+
+
 def test_an_empty_table(tmp_path: Path) -> None:
     table = create_tables(tmp_path).load_table(f"{NAMESPACE}.{EDITS_PER_MINUTE}")
     stats = footprint(table)
     assert (stats.rows, stats.data_files, stats.snapshots) == (0, 0, 0)
+    assert stats.files_by_day == {}
     assert stats.oldest_snapshot is None
     assert describe("wiki.edits_per_minute", stats, datetime.now(UTC)).endswith(": empty")

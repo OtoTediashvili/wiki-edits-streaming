@@ -79,11 +79,17 @@ def _map(options: dict[str, str]) -> str:
     return "map(" + ", ".join(f"{sql_string(k)}, {sql_string(v)}" for k, v in options.items()) + ")"
 
 
+# The procedures take the table with its catalog: given `wiki.changes`,
+# Iceberg first tries `wiki` as a catalog name and logs a stack trace (at
+# WARN) before falling back to the right one.
+
+
 def compact_sql(table: str, column: str, before: datetime) -> str:
     where = f"{column} < TIMESTAMP '{before:{_TS}}'"
     return (
         f"CALL {CATALOG}.system.rewrite_data_files("
-        f"table => {sql_string(table)}, strategy => 'binpack', where => {sql_string(where)}, "
+        f"table => {sql_string(f'{CATALOG}.{table}')}, strategy => 'binpack', "
+        f"where => {sql_string(where)}, "
         f"options => {_map(COMPACTION_OPTIONS)})"
     )
 
@@ -91,7 +97,8 @@ def compact_sql(table: str, column: str, before: datetime) -> str:
 def expire_sql(table: str, older_than: datetime, retain_last: int) -> str:
     return (
         f"CALL {CATALOG}.system.expire_snapshots("
-        f"table => {sql_string(table)}, older_than => TIMESTAMP '{older_than:{_TS}}', "
+        f"table => {sql_string(f'{CATALOG}.{table}')}, "
+        f"older_than => TIMESTAMP '{older_than:{_TS}}', "
         f"retain_last => {retain_last}, stream_results => true)"
     )
 

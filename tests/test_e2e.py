@@ -135,7 +135,11 @@ def test_replays_and_late_history_land_once_and_minutes_add_up(run: Run) -> None
     catalog = rest_catalog(run.lake)
     tables = {name: f"{run.namespace}.{name}" for name in (CHANGES, EDITS_PER_MINUTE)}
     before = {name: footprint(catalog.load_table(t)) for name, t in tables.items()}
-    assert before[CHANGES].data_files >= 6  # the recorded day in small files, and the late one
+    recorded_day = datetime.fromtimestamp(json.loads(recorded[-1].data)["timestamp"], UTC).date()
+    late_day = recorded_day - timedelta(days=3)
+    # The recorded day in small files, one per batch; the late event's day in one.
+    assert before[CHANGES].files_by_day[recorded_day] >= 5
+    assert before[CHANGES].files_by_day[late_day] == 1
     run_spark(
         run,
         "maintain",
@@ -146,7 +150,7 @@ def test_replays_and_late_history_land_once_and_minutes_add_up(run: Run) -> None
     after = {name: footprint(catalog.load_table(t)) for name, t in tables.items()}
     # The recorded day compacted to one file; the late event's day, a single
     # file already, left as it was.
-    assert after[CHANGES].data_files == 2
+    assert after[CHANGES].files_by_day == {recorded_day: 1, late_day: 1}
     for name in tables:
         assert after[name].snapshots == 1
         assert after[name].rows == before[name].rows

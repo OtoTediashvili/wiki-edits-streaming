@@ -226,9 +226,25 @@ laptop disk they add up:
 - **Snapshots.** One per commit per table, each listed in the metadata file
   that every commit and every reader loads.
 
-`make peek` shows all three for each table: rows and files now, how many
-snapshots are kept and how old the oldest is, and what the table takes on
-disk against what the current snapshot needs.
+`make peek` shows all three for each table: rows and files now (today's
+and every other day's), how many snapshots are kept and how old the oldest
+is, and what the table takes on disk against what the current snapshot
+needs.
+
+**Measured on the laptop,** after a day of streaming with maintenance
+running:
+
+| Table | Current data | On disk | Snapshots kept |
+|---|---|---|---|
+| `changes` | 12.1 million rows, 780 MB in 421 files | 1.5 GB | 349, the oldest 6 h old |
+| `edits_per_minute` | 427,000 rows, 4.6 MB in 111 files | 238 MB | 345, the oldest 6 h old |
+
+The minute table shows what copy-on-write costs: 98% of its footprint is
+versions the job has since replaced, kept by six hours of snapshots. That's
+about 40 MB an hour, so without expiry a 5 MB table would grow by roughly
+a gigabyte a day. In `changes`, most of the extra 700 MB is the small files
+compaction has replaced. They're deleted once the last snapshot that lists
+them is six hours old.
 
 **What runs.** Iceberg's own Spark procedures, once an hour inside the
 stream job (between its batches, in the same Spark session, so no second
@@ -298,7 +314,7 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 
 ## Tests
 
-- **166 unit tests** (`make test`), no network or Docker:
+- **167 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the

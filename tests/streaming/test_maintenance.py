@@ -30,7 +30,12 @@ def test_compacts_only_the_days_that_ended_then_expires_both_tables() -> None:
         ("expire", "wiki.edits_per_minute"),
     ]
     compact, expire, _ = tasks
-    assert compact.sql.startswith("CALL lake.system.rewrite_data_files(table => 'wiki.changes'")
+    # Catalog-qualified: `wiki.changes` alone makes Iceberg look for a catalog
+    # called `wiki` first, and log a stack trace when there isn't one.
+    assert compact.sql.startswith(
+        "CALL lake.system.rewrite_data_files(table => 'lake.wiki.changes'"
+    )
+    assert "table => 'lake.wiki.edits_per_minute'" in tasks[2].sql
     assert r"where => 'event_time < TIMESTAMP \'2026-10-19 00:00:00\''" in compact.sql
     assert "'min-input-files', '5'" in compact.sql
     assert "'target-file-size-bytes', '134217728'" in compact.sql

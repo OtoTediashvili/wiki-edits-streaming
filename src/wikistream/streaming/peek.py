@@ -9,11 +9,13 @@ down.
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlparse
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from pyarrow.fs import FileSelector, FileType
 from pyiceberg.catalog import Catalog
 from pyiceberg.io.pyarrow import PyArrowFileIO
@@ -36,6 +38,16 @@ class Footprint:
     oldest_snapshot: datetime | None
     disk_objects: int
     disk_bytes: int
+    files_by_day: dict[date, int]  # current data files per day partition
+
+
+def _files_by_day(table: Table) -> dict[date, int]:
+    """From the manifests: which day partition each current data file is in."""
+    files = table.inspect.files()
+    if files.num_rows == 0 or files.schema.field("partition").type.num_fields == 0:
+        return {}
+    data = files.filter(pc.equal(files["content"], 0))
+    return dict(Counter(data["partition"].combine_chunks().field(0).to_pylist()))
 
 
 def footprint(table: Table) -> Footprint:
@@ -57,6 +69,7 @@ def footprint(table: Table) -> Footprint:
         oldest_snapshot=datetime.fromtimestamp(oldest / 1000, UTC) if oldest else None,
         disk_objects=len(objects),
         disk_bytes=sum(info.size for info in objects),
+        files_by_day=_files_by_day(table),
     )
 
 
@@ -79,9 +92,13 @@ def describe(identifier: str, table: Footprint, now: datetime) -> str:
     oldest = table.oldest_snapshot
     age = f", the oldest {(now - oldest).total_seconds() / 3600:.1f} h old" if oldest else ""
     held = table.disk_bytes - table.data_bytes
+    today = table.files_by_day.get(now.date(), 0)
+    other_days = len(table.files_by_day) - (1 if today else 0)
     return (
         f"{identifier}: {_n(table.rows, 'row')} in {_n(table.data_files, 'file')} "
         f"({_size(table.data_bytes)}, {_size(average)} each on average)\n"
+        f"  files: {today:,} today (UTC), {_n(table.data_files - today, 'file')} across "
+        f"{_n(other_days, 'other day')}\n"
         f"  {_n(table.snapshots, 'snapshot')}{age}\n"
         f"  on disk: {_size(table.disk_bytes)} in {_n(table.disk_objects, 'object')}; "
         f"{_size(held)} of it is metadata and files only old snapshots hold"
