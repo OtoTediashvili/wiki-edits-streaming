@@ -15,16 +15,17 @@ from typing import Any
 
 import pytest
 from pyspark.sql import DataFrame, SparkSession
+from structlog.testing import capture_logs
 
-from tests.streaming.frames import decoded_schema
+from tests.streaming.frames import decoded_schema, undecodable
 from tests.streaming.memory import MemoryTables, Ranges
 from wikistream.streaming.job import BatchWriter, start_query
 from wikistream.streaming.settings import LakeSettings
-from wikistream.streaming.transform import to_changes
 
 
 def batch(spark: SparkSession, rows: list[dict[str, Any]]) -> DataFrame:
-    return to_changes(spark.createDataFrame(rows, schema=decoded_schema()))
+    """A micro-batch as decode() hands it to the writer."""
+    return spark.createDataFrame(rows, schema=decoded_schema())
 
 
 def at(row: dict[str, Any], event_time: datetime, event_id: str) -> dict[str, Any]:
@@ -181,6 +182,43 @@ def test_an_event_years_old_does_not_make_the_batch_read_the_years_between(
     assert len(tables.event_ids()) == 96
 
 
+def test_a_message_that_does_not_decode_is_set_aside_and_the_batch_goes_on(
+    spark: SparkSession, tables: MemoryTables, writer: BatchWriter, decoded: list[dict[str, Any]]
+) -> None:
+    """The first version stopped the job on such a message, for good: Spark
+    retried the same batch after every restart."""
+    poison = [
+        undecodable(b"this is not avro", partition=1, offset=500),
+        undecodable(b"\x00\x00\x00\x00\x01\xff\xff\xff", partition=2, offset=501),
+        undecodable(None, partition=0, offset=502),
+    ]
+    with capture_logs() as logs:
+        result = writer.write(batch(spark, [*decoded[:50], *poison, *decoded[50:]]), 0)
+
+    assert (result.received, result.written, result.rejected) == (95, 95, 3)
+    assert written_counts(tables) == counts_by_hand(tables)
+    assert {(r.kafka_partition, r.kafka_offset): (r.reason, r.value) for r in tables.rejected} == {
+        (1, 500): ("no schema registry header", b"this is not avro"),
+        (2, 501): ("does not decode as a WikiChange record", poison[1]["raw_value"]),
+        (0, 502): ("empty message", None),
+    }
+    [warning] = [e for e in logs if e["event"] == "batch.rejected"]
+    assert warning["log_level"] == "warning" and warning["set_aside"] == 3
+
+    # Replayed after a crash: nothing set aside twice, nothing written twice.
+    again = writer.write(batch(spark, [*decoded, *poison]), 0)
+    assert (again.written, again.rejected) == (0, 0)
+    assert len(tables.rejected) == 3
+
+
+def test_a_batch_of_nothing_but_rejects(
+    spark: SparkSession, tables: MemoryTables, writer: BatchWriter
+) -> None:
+    result = writer.write(batch(spark, [undecodable(b"junk", partition=0, offset=7)]), 3)
+    assert (result.received, result.written, result.rejected) == (0, 0, 1)
+    assert tables.changes == [] and tables.minutes == {}
+
+
 def test_the_streaming_query_writes_each_batch_and_resumes_from_its_checkpoint(
     spark: SparkSession, tmp_path: Path, decoded: list[dict[str, Any]]
 ) -> None:
@@ -197,7 +235,7 @@ def test_the_streaming_query_writes_each_batch_and_resumes_from_its_checkpoint(
         tmp.rename(source / f"{name}.json")
 
     def run_once() -> None:
-        stream = to_changes(spark.readStream.schema(decoded_schema()).json(str(source)))
+        stream = spark.readStream.schema(decoded_schema()).json(str(source))
         start_query(stream, BatchWriter(tables), settings, once=True).awaitTermination()
 
     deliver("a", decoded + decoded[:10])

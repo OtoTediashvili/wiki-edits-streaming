@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 CATALOG = "lake"
 CHANGES = "changes"
 EDITS_PER_MINUTE = "edits_per_minute"
+REJECTED = "rejected"
 
 
 class LakeSettings(BaseSettings):

@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tests.dashboard.lakes import NAMESPACE, arrow, create_tables, minute
-from wikistream.streaming.peek import describe, footprint
-from wikistream.streaming.settings import EDITS_PER_MINUTE
-from wikistream.streaming.transform import MINUTE_COLUMNS
+from tests.dashboard.lakes import NAMESPACE, arrow, create_tables, minute, schema
+from wikistream.streaming.peek import describe, footprint, set_aside
+from wikistream.streaming.settings import EDITS_PER_MINUTE, REJECTED
+from wikistream.streaming.transform import MINUTE_COLUMNS, REJECTED_COLUMNS
 
 T0 = datetime(2026, 10, 19, 10, 0)
 
@@ -62,3 +62,22 @@ def test_an_empty_table(tmp_path: Path) -> None:
     assert stats.files_by_day == {}
     assert stats.oldest_snapshot is None
     assert describe("wiki.edits_per_minute", stats, datetime.now(UTC)).endswith(": empty")
+
+
+def test_what_was_set_aside_and_why(tmp_path: Path) -> None:
+    cat = create_tables(tmp_path)
+    table = cat.create_table(f"{NAMESPACE}.{REJECTED}", schema=schema(REJECTED_COLUMNS))
+    assert set_aside(table, "wiki.rejected") == "wiki.rejected: nothing set aside"
+    rows = [
+        (0, 1, T0, "no schema registry header"),
+        (1, 2, T0 + timedelta(minutes=5), "no schema registry header"),
+        (2, 3, T0 + timedelta(minutes=1), "empty message"),
+    ]
+    table.append(arrow(REJECTED_COLUMNS, [
+        {"kafka_partition": p, "kafka_offset": o, "kafka_timestamp": t, "reason": r, "value": b"x"}
+        for p, o, t, r in rows
+    ]))  # fmt: skip
+    assert set_aside(table, "wiki.rejected") == (
+        "wiki.rejected: 3 messages set aside, the latest from 2026-10-19 10:05 UTC "
+        "(2 no schema registry header, 1 empty message)"
+    )

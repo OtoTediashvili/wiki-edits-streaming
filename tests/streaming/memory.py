@@ -15,7 +15,12 @@ from typing import Any
 
 from pyspark.sql import DataFrame, Row, SparkSession
 
-from wikistream.streaming.transform import CHANGE_COLUMNS, MINUTE_COLUMNS, ColumnSpec
+from wikistream.streaming.transform import (
+    CHANGE_COLUMNS,
+    MINUTE_COLUMNS,
+    REJECTED_COLUMNS,
+    ColumnSpec,
+)
 
 
 def _ddl(columns: tuple[ColumnSpec, ...]) -> str:
@@ -35,6 +40,7 @@ class MemoryTables:
         self.changes: list[Row] = []
         self.minutes: dict[tuple[str, datetime], Row] = {}
         self.ranges_read: list[tuple[datetime, datetime]] = []
+        self.rejected: list[Row] = []
 
     def _within(self, ranges: Ranges) -> list[Row]:
         bounds = [(_parse(a), _parse(b)) for a, b in ranges]
@@ -55,6 +61,14 @@ class MemoryTables:
         for row in rows.collect():
             assert any(lo <= row.window_start < hi for lo, hi in bounds), "recount outside ranges"
             self.minutes[(row.wiki, row.window_start)] = row
+
+    def rejected_offsets(self) -> DataFrame:
+        return self.spark.createDataFrame(self.rejected, _ddl(REJECTED_COLUMNS)).select(
+            "kafka_partition", "kafka_offset"
+        )
+
+    def append_rejected(self, rows: DataFrame) -> None:
+        self.rejected.extend(rows.collect())
 
     # --- for assertions ---------------------------------------------------
 

@@ -89,6 +89,15 @@ peek: ## Table sizes and the newest minutes, read from Iceberg
 maintain: ## Compact the days that ended and expire old snapshots, now (the job also does it hourly)
 	docker compose run --rm -T spark maintain
 
+drill: ## Break the running pipeline on purpose, then audit the lake: make drill NAME=job-crash (NAME=list)
+	@test -n "$(NAME)" || { echo "Which drill? make drill NAME=list"; exit 1; }
+	uv run python -m wikistream.drills $(NAME) $(ARGS)
+
+drills: ## Every drill, one after the other, stopping at the first failure (about 25 minutes)
+	@for name in producer-crash job-crash storage-outage broker-outage poison-message; do \
+		uv run python -m wikistream.drills $$name || exit 1; \
+	done
+
 lake-reset: ## Delete the Iceberg tables and the job's checkpoint; keeps Redpanda's topics
 	docker compose rm --stop --force spark seaweedfs
 	docker volume rm --force wiki-edits-streaming_seaweedfs-data wiki-edits-streaming_spark-checkpoints
@@ -126,5 +135,5 @@ clean: ## Remove local caches and the venv
 	rm -rf .venv .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov coverage.xml
 
 .PHONY: help install fmt lint typecheck test test-integration test-e2e check up down reset ps \
-	produce stop logs replay stream stream-stop stream-logs peek maintain lake-reset \
+	produce stop logs replay stream stream-stop stream-logs peek maintain drill drills lake-reset \
 	dashboard dashboard-stop dashboard-logs dashboard-dev topics consume partitions clean

@@ -40,13 +40,14 @@ from pyspark.sql.streaming.query import StreamingQuery
 
 from wikistream.logging_config import get_logger
 from wikistream.model import schema_str
-from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
+from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, REJECTED, LakeSettings
 from wikistream.streaming.tables import ensure_tables
 from wikistream.streaming.transform import (
     decode,
     minute_of,
     minutes_touched,
     recount,
+    rejects,
     time_ranges,
     to_changes,
     unseen,
@@ -88,6 +89,10 @@ class LakeTables(Protocol):
 
     def upsert_minutes(self, rows: DataFrame, ranges: Ranges) -> None: ...
 
+    def rejected_offsets(self) -> DataFrame: ...
+
+    def append_rejected(self, rows: DataFrame) -> None: ...
+
 
 def _within(column: str, ranges: Ranges) -> Column:
     """Literal bounds, so Iceberg skips every file and partition outside them."""
@@ -111,6 +116,7 @@ class IcebergTables:
         self.spark = spark
         self.changes = settings.table(CHANGES)
         self.minutes = settings.table(EDITS_PER_MINUTE)
+        self.rejected = settings.table(REJECTED)
 
     def changes_in(self, ranges: Ranges) -> DataFrame:
         return self.spark.table(self.changes).where(_within("event_time", ranges))
@@ -120,6 +126,13 @@ class IcebergTables:
 
     def append_changes(self, rows: DataFrame) -> None:
         rows.writeTo(self.changes).append()
+
+    def rejected_offsets(self) -> DataFrame:
+        # Rare, so read whole: a few rows at most, unless something is badly wrong.
+        return self.spark.table(self.rejected).select("kafka_partition", "kafka_offset")
+
+    def append_rejected(self, rows: DataFrame) -> None:
+        rows.writeTo(self.rejected).append()
 
     def upsert_minutes(self, rows: DataFrame, ranges: Ranges) -> None:
         rows.createOrReplaceTempView("minute_updates")
@@ -137,15 +150,17 @@ class IcebergTables:
 
 @dataclass(frozen=True)
 class BatchResult:
-    received: int
+    received: int  # records that decoded
     distinct: int
     written: int
     minutes: int
     ranges: int
+    rejected: int = 0  # records that didn't, newly set aside
 
 
 class BatchWriter:
-    """The foreachBatch function: one micro-batch of `changes` rows into the lake."""
+    """The foreachBatch function: one micro-batch of decoded records into the
+    lake. Records that didn't decode go to the rejected table first."""
 
     def __init__(self, tables: LakeTables) -> None:
         self.tables = tables
@@ -160,13 +175,18 @@ class BatchWriter:
         finally:
             batch.unpersist()
 
-    def _write(self, batch: DataFrame, batch_id: int) -> BatchResult:
-        stats = batch.agg(
-            F.count(F.lit(1)).alias("received"),
+    def _write(self, decoded: DataFrame, batch_id: int) -> BatchResult:
+        stats = decoded.agg(
+            F.count_if(F.col("decoded")).alias("received"),
             F.count_distinct("event_id").alias("distinct"),
+            F.count_if(~F.col("decoded")).alias("rejected"),
         ).first()
-        if stats is None or stats.received == 0:
+        if stats is None:
             return BatchResult(0, 0, 0, 0, 0)
+        rejected = self._set_aside(decoded, batch_id) if stats.rejected else 0
+        if stats.received == 0:
+            return BatchResult(0, 0, 0, 0, 0, rejected)
+        batch = to_changes(decoded)
         minute_rows = batch.select(
             F.date_format(minute_of(F.col("event_time")), _TS).alias("minute")
         ).distinct()
@@ -191,11 +211,14 @@ class BatchWriter:
         finally:
             touched.unpersist()
 
-        result = BatchResult(stats.received, stats.distinct, written, minutes, len(ranges))
+        result = BatchResult(
+            stats.received, stats.distinct, written, minutes, len(ranges), rejected
+        )
         log.info(
             "batch.written",
             batch=batch_id,
             received=result.received,
+            rejected=result.rejected,
             duplicates=result.received - result.distinct,
             already_written=result.distinct - result.written,
             written=result.written,
@@ -206,9 +229,35 @@ class BatchWriter:
         )
         return result
 
+    def _set_aside(self, decoded: DataFrame, batch_id: int) -> int:
+        """Records that didn't decode, into the rejected table, each once:
+        a replayed batch finds its rejects there already, by offset."""
+        new = rejects(decoded).join(
+            self.tables.rejected_offsets(), on=["kafka_partition", "kafka_offset"], how="left_anti"
+        )
+        new = new.persist()
+        sample = []
+        try:
+            count = new.count()
+            if count:
+                self.tables.append_rejected(new)
+                sample = new.select("kafka_partition", "kafka_offset", "reason").take(10)
+        finally:
+            new.unpersist()
+        if count:
+            # Loud: a stream of these means the producer and the job disagree
+            # about the schema, and the lake is missing data until it's fixed.
+            log.warning(
+                "batch.rejected",
+                batch=batch_id,
+                set_aside=count,
+                first=[f"{r.kafka_partition}/{r.kafka_offset}: {r.reason}" for r in sample],
+            )
+        return count
 
-def changes_stream(spark: SparkSession, settings: LakeSettings) -> DataFrame:
-    return to_changes(decode(read_kafka(spark, settings), schema_str()))
+
+def decoded_stream(spark: SparkSession, settings: LakeSettings) -> DataFrame:
+    return decode(read_kafka(spark, settings), schema_str())
 
 
 def start_query(
@@ -229,7 +278,7 @@ def start_query(
 def start_queries(spark: SparkSession, settings: LakeSettings, once: bool) -> list[StreamingQuery]:
     ensure_tables(spark, settings)
     writer = BatchWriter(IcebergTables(spark, settings))
-    return [start_query(changes_stream(spark, settings), writer, settings, once)]
+    return [start_query(decoded_stream(spark, settings), writer, settings, once)]
 
 
 class ProgressLog(StreamingQueryListener):

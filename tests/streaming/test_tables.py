@@ -10,7 +10,12 @@ from structlog.testing import capture_logs
 
 from wikistream.streaming.settings import LakeSettings
 from wikistream.streaming.tables import TABLE_PROPERTIES, create_table_sql, ddl, ensure_tables
-from wikistream.streaming.transform import CHANGE_COLUMNS, MINUTE_COLUMNS, ColumnSpec
+from wikistream.streaming.transform import (
+    CHANGE_COLUMNS,
+    MINUTE_COLUMNS,
+    REJECTED_COLUMNS,
+    ColumnSpec,
+)
 
 
 @pytest.fixture
@@ -18,18 +23,25 @@ def statements() -> list[str]:
     return ddl(LakeSettings(_env_file=None, lake_namespace="wiki"))  # type: ignore[call-arg]
 
 
-def test_namespace_then_both_tables(statements: list[str]) -> None:
-    namespace, changes, minutes = statements
+def test_namespace_then_the_tables(statements: list[str]) -> None:
+    namespace, changes, minutes, rejected = statements
     assert namespace == "CREATE NAMESPACE IF NOT EXISTS lake.wiki"
     assert changes.startswith("CREATE TABLE IF NOT EXISTS lake.wiki.changes (")
     assert "PARTITIONED BY (days(event_time))" in changes
     assert minutes.startswith("CREATE TABLE IF NOT EXISTS lake.wiki.edits_per_minute (")
     assert "PARTITIONED BY (days(window_start))" in minutes
+    assert rejected.startswith("CREATE TABLE IF NOT EXISTS lake.wiki.rejected (")
+    assert "PARTITIONED BY (days(kafka_timestamp))" in rejected
+    assert "`value` BINARY COMMENT" in rejected
 
 
 def test_columns_come_from_the_specs_in_order(statements: list[str]) -> None:
-    _, changes, minutes = statements
-    for sql, columns in ((changes, CHANGE_COLUMNS), (minutes, MINUTE_COLUMNS)):
+    _, changes, minutes, rejected = statements
+    for sql, columns in (
+        (changes, CHANGE_COLUMNS),
+        (minutes, MINUTE_COLUMNS),
+        (rejected, REJECTED_COLUMNS),
+    ):
         positions = [sql.index(f"`{c.name}` {c.sql_type} COMMENT") for c in columns]
         assert positions == sorted(positions)
     for key, value in TABLE_PROPERTIES.items():
@@ -113,6 +125,7 @@ def test_no_table_is_partitioned_by_its_first_column() -> None:
     for columns, partition_column in (
         (CHANGE_COLUMNS, "event_time"),
         (MINUTE_COLUMNS, "window_start"),
+        (REJECTED_COLUMNS, "kafka_timestamp"),
     ):
         assert columns[0].name != partition_column
 

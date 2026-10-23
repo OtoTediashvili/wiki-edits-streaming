@@ -32,17 +32,34 @@ def _spark_type(avro_type: Any) -> tuple[T.DataType, bool]:
 
 
 def decoded_schema() -> T.StructType:
-    """What `transform.decode` produces: the Avro fields, then Kafka's."""
+    """What `transform.decode` produces: the Avro fields, then Kafka's, then
+    whether the record decoded. Every Avro field is nullable: from_avro's
+    PERMISSIVE mode returns nulls for a record it can't read."""
     fields = [
-        T.StructField(f["name"], *_spark_type(f["type"]))
+        T.StructField(f["name"], _spark_type(f["type"])[0], True)
         for f in json.loads(schema_str())["fields"]
     ]
     fields += [
         T.StructField("kafka_partition", T.IntegerType()),
         T.StructField("kafka_offset", T.LongType()),
         T.StructField("kafka_timestamp", T.TimestampType()),
+        T.StructField("decoded", T.BooleanType()),
+        T.StructField("raw_value", T.BinaryType()),
     ]
     return T.StructType(fields)
+
+
+def undecodable(value: bytes | None, partition: int, offset: int) -> dict[str, Any]:
+    """A record from_avro couldn't read: every field null, the bytes kept."""
+    row: dict[str, Any] = {field.name: None for field in decoded_schema().fields}
+    return {
+        **row,
+        "kafka_partition": partition,
+        "kafka_offset": offset,
+        "kafka_timestamp": datetime(2026, 10, 22, 18, 0),
+        "decoded": False,
+        "raw_value": value,
+    }
 
 
 def _ts(millis: int) -> datetime:
@@ -60,7 +77,11 @@ def decoded_rows(events: list[SseEvent]) -> list[dict[str, Any]]:
         row["event_time"] = _ts(row["event_time"])
         row["stream_time"] = _ts(row["stream_time"])
         row.update(
-            kafka_partition=offset % 3, kafka_offset=offset, kafka_timestamp=row["stream_time"]
+            kafka_partition=offset % 3,
+            kafka_offset=offset,
+            kafka_timestamp=row["stream_time"],
+            decoded=True,
+            raw_value=None,
         )
         rows.append(row)
     return rows

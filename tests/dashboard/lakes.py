@@ -19,6 +19,7 @@ from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import DayTransform
 from pyiceberg.types import (
+    BinaryType,
     BooleanType,
     IcebergType,
     IntegerType,
@@ -41,6 +42,7 @@ _TYPES: dict[str, IcebergType] = {
     "INT": IntegerType(),
     "BIGINT": LongType(),
     "BOOLEAN": BooleanType(),
+    "BINARY": BinaryType(),
 }
 
 # Calls to the page's `reconnect` hook, for the test that checks it.

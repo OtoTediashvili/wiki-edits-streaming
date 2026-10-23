@@ -22,7 +22,7 @@ from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import Table
 
 from wikistream.streaming.catalog import rest_catalog
-from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
+from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, REJECTED, LakeSettings
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,20 @@ def describe(identifier: str, table: Footprint, now: datetime) -> str:
     )
 
 
+def set_aside(table: Table, identifier: str) -> str:
+    """One line on the rejected table: how many, the latest, and why."""
+    rows = table.scan(selected_fields=("kafka_timestamp", "reason")).to_arrow()
+    if rows.num_rows == 0:
+        return f"{identifier}: nothing set aside"
+    latest = max(rows["kafka_timestamp"].to_pylist())
+    reasons = Counter(rows["reason"].to_pylist())
+    why = ", ".join(f"{count} {reason}" for reason, count in reasons.most_common())
+    return (
+        f"{identifier}: {_n(rows.num_rows, 'message')} set aside, "
+        f"the latest from {latest:%Y-%m-%d %H:%M} UTC ({why})"
+    )
+
+
 def _newest_minutes(catalog: Catalog, identifier: str, minutes: int = 10) -> pa.Table:
     """Totals for the newest minutes in the table, whatever the clock says:
     while the job catches up on history, those are hours or days old."""
@@ -138,6 +152,9 @@ def main() -> int:
     for name in (CHANGES, EDITS_PER_MINUTE):
         identifier = f"{namespace}.{name}"
         print(describe(identifier, footprint(catalog.load_table(identifier)), now))
+    rejected = f"{namespace}.{REJECTED}"
+    if catalog.table_exists(rejected):
+        print(set_aside(catalog.load_table(rejected), rejected))
     newest = _newest_minutes(catalog, f"{namespace}.{EDITS_PER_MINUTE}")
     if newest.num_rows == 0:
         print("\nNo minutes counted yet.")

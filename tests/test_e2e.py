@@ -32,11 +32,12 @@ from wikistream.__main__ import build_pipeline
 from wikistream.config import Settings
 from wikistream.dashboard.lake import Lake, naive_utc
 from wikistream.dashboard.queries import compact, percent, signed_bytes
+from wikistream.drills.topic import send_poison
 from wikistream.source import replay
 from wikistream.sse import SseEvent
 from wikistream.streaming.catalog import rest_catalog
 from wikistream.streaming.peek import footprint
-from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, LakeSettings
+from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, REJECTED, LakeSettings
 
 pytestmark = pytest.mark.e2e
 
@@ -69,7 +70,7 @@ def run(tmp_path: Path) -> Iterator[Run]:
     yield Run(topic, lake.lake_namespace, checkpoint_dir, producer, lake)
 
     catalog = rest_catalog(lake)
-    for name in (CHANGES, EDITS_PER_MINUTE):
+    for name in (CHANGES, EDITS_PER_MINUTE, REJECTED):
         if catalog.table_exists(f"{lake.lake_namespace}.{name}"):
             catalog.purge_table(f"{lake.lake_namespace}.{name}")
     if catalog.namespace_exists(lake.lake_namespace):
@@ -118,9 +119,13 @@ def test_replays_and_late_history_land_once_and_minutes_add_up(run: Run) -> None
     # A producer that crashed and resent everything: 190 messages, 95 events.
     for _ in range(2):
         assert build_pipeline(run.producer, None).run(iter(recorded)).produced == 95
+    # And two messages no producer of ours would send. The job must set them
+    # aside and carry on, not stop.
+    poison = send_poison(run.producer.bootstrap_servers, run.topic)
     # Small batches, like a day of live traffic: one small file each.
     run_spark(run, "once", WIKISTREAM_MAX_OFFSETS_PER_TRIGGER="10")
     check_lake(rest_catalog(run.lake), run.namespace, recorded_ids)
+    check_rejected(rest_catalog(run.lake), run.namespace, poison)
 
     # Then an event three days older than anything processed so far. A
     # watermark-based job drops it as late; this one must write it.
@@ -246,3 +251,17 @@ def check_dashboard(catalog: Catalog, namespace: str) -> None:
         "Editors, last hour": compact(len({u for u in shown["user"].to_pylist() if u})),
         "Content added": signed_bytes(sum(deltas)),
     }
+
+
+def check_rejected(catalog: Catalog, namespace: str, poison: list[tuple[int, int]]) -> None:
+    """Decoded by the real Spark image (the Avro connector isn't on the unit
+    tests' classpath): both poison messages set aside, with the reason."""
+    rows = catalog.load_table(f"{namespace}.{REJECTED}").scan().to_arrow()
+    offsets = zip(
+        rows["kafka_partition"].to_pylist(), rows["kafka_offset"].to_pylist(), strict=True
+    )
+    assert sorted(offsets) == poison
+    assert sorted(rows["reason"].to_pylist()) == [
+        "does not decode as a WikiChange record",
+        "no schema registry header",
+    ]

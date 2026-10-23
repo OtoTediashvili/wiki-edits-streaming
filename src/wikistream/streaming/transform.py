@@ -1,6 +1,7 @@
 """The stream job's logic, as functions from DataFrame to DataFrame.
 
     Kafka rows ──decode──▶ WikiChange records ──to_changes──▶ table rows
+                       └──▶ records that don't decode ──rejects──▶ rejected rows
     batch of rows ──unseen──▶ rows not yet in the table (each event once)
     rows ──minutes_touched / recount──▶ per-wiki counts for those minutes
 
@@ -60,6 +61,16 @@ CHANGE_COLUMNS: tuple[ColumnSpec, ...] = (
     ColumnSpec("kafka_timestamp", "TIMESTAMP", "When the producer wrote it to Redpanda"),
 )
 
+# Messages that don't decode as a WikiChange, set aside instead of stopping
+# the job. `kafka_partition` first: the partition column can't be first.
+REJECTED_COLUMNS: tuple[ColumnSpec, ...] = (
+    ColumnSpec("kafka_partition", "INT", "Partition in our Redpanda topic"),
+    ColumnSpec("kafka_offset", "BIGINT", "Offset in our Redpanda topic"),
+    ColumnSpec("kafka_timestamp", "TIMESTAMP", "When it was written to Redpanda"),
+    ColumnSpec("reason", "STRING", "Why it was set aside"),
+    ColumnSpec("value", "BINARY", "The message exactly as received; null if it was empty"),
+)
+
 # `wiki` comes first on purpose: the partition column must not be the first
 # column (see tables.create_table_sql).
 MINUTE_COLUMNS: tuple[ColumnSpec, ...] = (
@@ -90,26 +101,63 @@ def _typed(columns: tuple[ColumnSpec, ...]) -> list[Column]:
 
 def decode(kafka_rows: DataFrame, avro_schema: str) -> DataFrame:
     """Kafka records (key, value, partition, offset, timestamp, ...) to one
-    column per WikiChange field, plus where each record sat in Redpanda.
+    column per WikiChange field, plus where each record sat in Redpanda,
+    `decoded`, and `raw_value`.
 
-    Fails the query on a record that doesn't decode (from_avro's default
-    FAILFAST mode). The producer validates every record against this schema
-    before sending, so such a record means a bug, and stopping is the right
-    response.
+    A record that doesn't decode doesn't stop the job. It comes out with
+    `decoded` false and its bytes in `raw_value`, and the batch writer sets it
+    aside in the rejected table. The first version failed the query instead
+    (from_avro's FAILFAST mode): the producer validates every record, so a bad
+    one "means a bug". True, but one such message then stopped the whole lake
+    until someone edited the job's checkpoint by hand.
+
+    In PERMISSIVE mode from_avro returns a struct of nulls for bytes it can't
+    read, and null for an empty message; every real record has an event_id.
     """
     body = F.expr(f"substring(value, {_CONFLUENT_HEADER_BYTES + 1})")
+    decoded = F.col("change.event_id").isNotNull()
     return kafka_rows.select(
-        from_avro(body, avro_schema).alias("change"),
+        from_avro(body, avro_schema, {"mode": "PERMISSIVE"}).alias("change"),
+        F.col("value"),
         F.col("partition").alias("kafka_partition"),
         F.col("offset").alias("kafka_offset"),
         F.col("timestamp").alias("kafka_timestamp"),
-    ).select("change.*", "kafka_partition", "kafka_offset", "kafka_timestamp")
+    ).select(
+        "change.*",
+        "kafka_partition",
+        "kafka_offset",
+        "kafka_timestamp",
+        decoded.alias("decoded"),
+        F.when(~decoded, F.col("value")).alias("raw_value"),
+    )
 
 
 def to_changes(decoded: DataFrame) -> DataFrame:
-    """Decoded records to rows of the changes table."""
-    with_delta = decoded.withColumn("length_delta", F.col("length_new") - F.col("length_old"))
+    """Decoded records to rows of the changes table. Only records that
+    decoded: the others go through `rejects`."""
+    good = decoded.where(F.col("decoded"))
+    with_delta = good.withColumn("length_delta", F.col("length_new") - F.col("length_old"))
     return with_delta.select(*_typed(CHANGE_COLUMNS))
+
+
+_REASON_SQL = f"""CASE
+    WHEN raw_value IS NULL OR length(raw_value) = 0 THEN 'empty message'
+    WHEN length(raw_value) < {_CONFLUENT_HEADER_BYTES} OR substring(raw_value, 1, 1) != X'00'
+        THEN 'no schema registry header'
+    ELSE 'does not decode as a WikiChange record'
+END"""
+
+
+def rejects(decoded: DataFrame) -> DataFrame:
+    """The records that didn't decode, as rows of the rejected table."""
+    bad = decoded.where(~F.col("decoded"))
+    return bad.select(
+        F.col("kafka_partition"),
+        F.col("kafka_offset"),
+        F.col("kafka_timestamp"),
+        F.expr(_REASON_SQL).alias("reason"),
+        F.col("raw_value").alias("value"),
+    ).select(*_typed(REJECTED_COLUMNS))
 
 
 def unseen(batch: DataFrame, existing_ids: DataFrame) -> DataFrame:

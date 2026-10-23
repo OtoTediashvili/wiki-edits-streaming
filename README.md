@@ -142,6 +142,16 @@ retention, the messages it never read are gone. It then stops with an error
 start it once with `WIKISTREAM_FAIL_ON_DATA_LOSS=false` in `.env`, then
 remove the line.
 
+**Messages that don't decode are set aside, not fatal.** Anything in the
+topic that isn't a WikiChange record (plain bytes, an empty message, a
+schema the job doesn't know) goes to `wiki.rejected` with its partition,
+offset, bytes and the reason, and the batch carries on. The first version
+stopped the job instead: the producer validates every record, so a bad one
+"can only be a bug". True, but Spark then retried the same batch after every
+restart, and the lake stopped until someone edited the checkpoint by hand.
+Set-aside messages are logged at WARNING and counted by `make peek`, so a
+schema mismatch can't hide.
+
 **What is not stored.** `raw`, the original JSON, stays in Redpanda for 48
 hours and is left out of Iceberg, which would otherwise be five times larger
 on a laptop disk. A field that becomes interesting goes into the Avro schema,
@@ -282,6 +292,36 @@ each run does, that Spark's parser accepts every call, that a failed task
 doesn't stop the rest, and that the hourly schedule can't take the stream
 job down.
 
+## Failure drills
+
+"Exactly once" is a claim until something breaks. The drills break the
+running pipeline on purpose, then check the lake against the topic.
+
+| Drill | What breaks | What should happen |
+|---|---|---|
+| `producer-crash` | `kill -9` the producer between two checkpoints | It resumes from its saved position and resends up to 5 s of events; the lake keeps one copy of each |
+| `job-crash` | `kill -9` the Spark job in the middle of a batch, three times | Spark replays the unfinished batch; the idempotent writes change nothing already written |
+| `storage-outage` | SeaweedFS (catalog and S3) stopped for 2 minutes | Batches fail, the job exits, Docker restarts it until storage is back, and it catches up |
+| `broker-outage` | Redpanda stopped for 1 minute | Producer and job exit and are restarted; the producer fetches what it missed from Wikimedia |
+| `poison-message` | Two malformed messages written straight to the topic | The job sets them aside in `wiki.rejected` and carries on |
+
+**How "nothing lost, nothing twice" is checked.** Before breaking anything,
+the drill notes where each partition of the topic ends, and after recovery,
+where they end again. It reads every message in between, decoded the way
+the producer encoded it, and then audits the lake:
+
+- every event sent is in `changes` exactly once, however often it was sent;
+- every message that isn't a WikiChange is in `rejected`;
+- every minute those events fall in is counted right, wiki by wiki.
+
+It checks until the lake passes or 20 minutes are up, and the report in
+`docs/drills/` records what was done when, the counts, and how long after
+the broken part was back the lake had everything. The job is caught in the
+middle of a batch through Spark's REST API, not by luck.
+
+What breaks what, and what to do about each, is in the
+[runbook](docs/runbook.md).
+
 ## Run it
 
 Needs Docker, [uv](https://docs.astral.sh/uv/) 0.11.32 or newer, make, and
@@ -298,6 +338,7 @@ make stream               # the Spark job; make stream-logs, Spark UI on :4040
 make dashboard            # the live dashboard on :8501
 make peek                 # table sizes, disk use and the newest minutes, in the terminal
 make maintain             # compact and expire snapshots now (the job also does it hourly)
+make drill NAME=list      # the failure drills; make drill NAME=job-crash runs one
 
 make test-integration     # producer -> Redpanda -> consumer
 make test-e2e             # recording -> Redpanda -> Spark -> Iceberg, read back
@@ -314,7 +355,7 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 
 ## Tests
 
-- **167 unit tests** (`make test`), no network or Docker:
+- **207 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the
@@ -336,7 +377,13 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
     down;
   - maintenance: what each run does, Spark's parser over every procedure
     call, a failed task not stopping the rest, the hourly schedule, and
-    `make peek`'s disk figures on tables with superseded files.
+    `make peek`'s disk figures on tables with superseded files;
+  - the quarantine: malformed, headerless and empty messages set aside
+    with the right reason, a batch of nothing but those, and a replay that
+    sets nothing aside twice;
+  - the drills, with the stack, the topic and the lake faked: what each
+    drill breaks and in what order, the audit's verdict for each kind of
+    failure, reading a window of the topic, and the report.
 - **Integration tests** (`make test-integration`): the recording goes through
   the real producer, Redpanda and schema registry and is read back by a
   consumer; topic retention and repeatable topic creation are checked.
@@ -346,8 +393,10 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   PyIceberg reads the tables back: every event exactly once, and per-minute
   counts that agree with the rows. Then the dashboard is rendered over what
   Spark wrote, and each of its numbers is checked against the same number
-  counted from the rows. Last, maintenance runs in the Spark image, and the
-  same checks pass on fewer files and less disk.
+  counted from the rows. Two malformed messages ride along in the topic and
+  must end up in `wiki.rejected`, decoded by the real Spark image. Last,
+  maintenance runs in the Spark image, and the same checks pass on fewer
+  files and less disk.
 - The tests were checked by breaking the code on purpose: forgetting the
   resume id, resuming a datacenter from "now", retrying a 4xx, saving the position before the broker confirms,
   keeping canaries, skipping schema validation, not checking which events
@@ -358,9 +407,13 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
   filling, adding up editors instead of counting distinct ones, reading
   every file and filtering afterwards, letting bots into the page list,
   ranking one person's tool run above a page several people are editing,
-  sending chart times without a zone; and in maintenance, compacting
-  today, expiring without keeping the last snapshots, letting one failed
-  task stop the rest. Each break fails a test.
+  sending chart times without a zone; in maintenance, compacting today,
+  expiring without keeping the last snapshots, letting one failed task stop
+  the rest; and in the quarantine and the drills, letting a reject become a
+  change, setting a replayed reject aside twice, logging rejects quietly,
+  an audit that misses a lost event, a double, an unquarantined message or
+  a count with no rows behind it, and a window that reads one message past
+  its end. Each break fails a test.
 
 CI runs all of it: lint, strict mypy, unit tests, the integration and
 end-to-end tests against the same `docker-compose.yml`, all three image
@@ -385,6 +438,10 @@ src/wikistream/
     maintenance.py    compaction and snapshot expiry, hourly and on demand
     catalog.py        the REST catalog for Python readers (PyIceberg)
     peek.py           read the tables from the host with PyIceberg: sizes, disk use
+  drills/
+    topic.py          where each partition ends; the messages in between, decoded
+    audit.py          the verdict: every event once, poison set aside, minutes right
+    drills.py         the five drills, the runner, the report
   dashboard/
     lake.py           what the page reads: time-bounded scans, freshness from metadata
     queries.py        every number on the page, as DuckDB SQL over Arrow
@@ -394,6 +451,8 @@ docker-compose.yml    Redpanda, Console, SeaweedFS, producer, Spark job, dashboa
 Dockerfile            producer image
 spark.Dockerfile      Spark job image, connector jars fetched at build time
 dashboard.Dockerfile  dashboard image: no Spark, no Java
+docs/runbook.md       each failure: what you see, what happens on its own, what to do
+docs/drills/          the drills' reports
 ```
 
 ## Stack

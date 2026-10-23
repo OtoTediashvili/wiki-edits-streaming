@@ -12,8 +12,19 @@ import time
 from pyspark.sql import SparkSession
 
 from wikistream.logging_config import get_logger
-from wikistream.streaming.settings import CATALOG, CHANGES, EDITS_PER_MINUTE, LakeSettings
-from wikistream.streaming.transform import CHANGE_COLUMNS, MINUTE_COLUMNS, ColumnSpec
+from wikistream.streaming.settings import (
+    CATALOG,
+    CHANGES,
+    EDITS_PER_MINUTE,
+    REJECTED,
+    LakeSettings,
+)
+from wikistream.streaming.transform import (
+    CHANGE_COLUMNS,
+    MINUTE_COLUMNS,
+    REJECTED_COLUMNS,
+    ColumnSpec,
+)
 
 log = get_logger(__name__)
 
@@ -78,6 +89,12 @@ def ddl(settings: LakeSettings) -> list[str]:
             MINUTE_COLUMNS,
             "days(window_start)",
             "Changes per wiki per minute of event time; final once written",
+        ),
+        create_table_sql(
+            settings.table(REJECTED),
+            REJECTED_COLUMNS,
+            "days(kafka_timestamp)",
+            "Messages from the topic that didn't decode, set aside with the reason",
         ),
     ]
 

@@ -8,13 +8,14 @@ from typing import Any
 
 from pyspark.sql import DataFrame, SparkSession
 
-from tests.streaming.frames import decoded_schema
+from tests.streaming.frames import decoded_schema, undecodable
 from wikistream.streaming.transform import (
     CHANGE_COLUMNS,
     MINUTE_COLUMNS,
     minutes_touched,
     per_minute,
     recount,
+    rejects,
     time_ranges,
     to_changes,
     unseen,
@@ -148,3 +149,32 @@ def test_time_ranges_join_nearby_minutes_and_keep_far_ones_apart() -> None:
         ("2026-10-19 06:01:00", "2026-10-19 06:02:00"),
         ("2026-10-19 06:05:00", "2026-10-19 06:06:00"),
     ]
+
+
+def test_rejects_say_why_and_keep_the_bytes(spark: SparkSession) -> None:
+    rows = [
+        undecodable(b"plain text", partition=0, offset=1),
+        undecodable(b"\x00\x01", partition=0, offset=2),  # too short for the header
+        undecodable(b"\x00\x00\x00\x00\x07garbage", partition=1, offset=3),
+        undecodable(b"", partition=1, offset=4),
+        undecodable(None, partition=2, offset=5),
+    ]
+    out = rejects(spark.createDataFrame(rows, decoded_schema())).collect()
+    assert [(r.kafka_offset, r.reason) for r in out] == [
+        (1, "no schema registry header"),
+        (2, "no schema registry header"),
+        (3, "does not decode as a WikiChange record"),
+        (4, "empty message"),
+        (5, "empty message"),
+    ]
+    assert out[0].value == b"plain text" and out[4].value is None
+    assert out[0].kafka_timestamp == datetime(2026, 10, 22, 18, 0)
+
+
+def test_only_records_that_decoded_become_changes(
+    spark: SparkSession, decoded: list[dict[str, Any]]
+) -> None:
+    rows = [*decoded[:5], undecodable(b"junk", partition=0, offset=99)]
+    changes = to_changes(spark.createDataFrame(rows, decoded_schema()))
+    assert changes.count() == 5
+    assert rejects(spark.createDataFrame(rows, decoded_schema())).count() == 1
