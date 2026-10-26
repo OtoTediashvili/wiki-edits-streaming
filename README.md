@@ -17,6 +17,9 @@ flowchart LR
     L -->|PyIceberg + DuckDB| D[Live dashboard<br/>Streamlit]
 ```
 
+The whole design on one page, with the guarantees and the trade-offs:
+[docs/architecture.md](docs/architecture.md).
+
 ![The dashboard on live data: status, six numbers for the last hour, changes per minute by people and bots, the busiest wikis](docs/dashboard.png)
 
 **Status:** ingestion, the stream job and the live dashboard are done, with
@@ -174,7 +177,9 @@ seconds, and writes nothing.
 
 - **Status line:** *Live*, *Catching up* (with how far behind the clock the
   newest counts are) or *Stalled* (no commit from the job for 5 minutes,
-  with the command to check it).
+  with the command to check it). During a replay, the few live changes
+  counted hours ahead of the rest don't make it *Live*: the page goes by
+  the newest full minute and says how many are ahead.
 - **Six numbers for the window:** changes per minute, edits, new pages, bot
   share, distinct editors, net bytes added.
 - **Changes per minute,** people and bots, with a crosshair and the exact
@@ -361,7 +366,7 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 
 ## Tests
 
-- **214 unit tests** (`make test`), no network or Docker:
+- **215 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the

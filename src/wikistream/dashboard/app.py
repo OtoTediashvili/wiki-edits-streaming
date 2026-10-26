@@ -7,7 +7,9 @@ every 30 seconds without reloading the page. Nothing here writes.
 Everything is UTC, like the tables. The window ends at the newest complete
 minute in the lake rather than at the clock, so after time away the page
 shows the latest counts while the job catches up, and says how far behind
-they are.
+they are. During a replay, a few live changes can be counted hours ahead of
+the rest; the window then ends at the newest *full* minute instead
+(`Lake.position`), and the page says what is counted ahead of it.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import streamlit as st
 from pydantic import Field
 from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError
 
-from wikistream.dashboard.lake import Lake, LakeState
+from wikistream.dashboard.lake import Lake, LakeState, Position
 from wikistream.dashboard.queries import (
     ALL_WIKIS,
     DEFAULT_SPAN,
@@ -49,6 +51,10 @@ TITLE = "Wikipedia edits, live"
 LIVE_LAG = timedelta(minutes=5)
 # The job commits once a minute; this long without a commit means it stopped.
 STALLED_AFTER = timedelta(minutes=5)
+# Where to look for the newest full minute first: the hour before the newest
+# minute. Only a longer replay, with stragglers alone in that hour, makes the
+# page read the whole minute table (a few megabytes).
+NEAR = timedelta(hours=1)
 
 
 class DashboardSettings(LakeSettings):
@@ -213,6 +219,24 @@ def _state(_lake: Lake, key: str) -> LakeState:
     return _lake.state()
 
 
+# Keyed on the newest minute and the last write, so it's read again only
+# after the job has written.
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+def _position(_lake: Lake, key: str, newest: datetime, last_write: datetime | None) -> Position:
+    near = _lake.position(since=newest - NEAR)
+    return near if near.full_minute is not None else _lake.position()
+
+
+def anchor(state: LakeState, position: Position) -> tuple[datetime, int]:
+    """The minute the window ends at, and how many straggling changes are
+    counted after it: the newest minute, unless a replay has put stragglers
+    far ahead of the newest full one."""
+    assert state.newest_minute is not None
+    if position.straggling and position.full_minute is not None:
+        return position.full_minute, position.ahead
+    return state.newest_minute, 0
+
+
 @st.cache_data(ttl=20, show_spinner=False)
 def _read(_lake: Lake, key: str, window: Window, detail: Window) -> tuple[pa.Table, pa.Table]:
     return _lake.minutes(window.start, window.end), _lake.changes(detail.start, detail.end)
@@ -258,6 +282,11 @@ def _live(
     try:
         lake = open_lake()
         state = _state(lake, lake.key)
+        position = (
+            Position(None, None, 0)
+            if state.newest_minute is None
+            else _position(lake, lake.key, state.newest_minute, state.last_write)
+        )
     except (NoSuchTableError, NoSuchNamespaceError):
         st.info(
             "No tables yet. The stream job creates them when it starts: `make stream`. "
@@ -290,7 +319,8 @@ def _live(
             key="window",
             bind="query-params",
         )
-    window = window_for(state.newest_minute, clock, SPANS[span or DEFAULT_SPAN])
+    end, ahead = anchor(state, position)
+    window = window_for(end, clock, SPANS[span or DEFAULT_SPAN])
     detail = detail_window(window)
     minutes, changes = _read(lake, lake.key, window, detail)
     everything = Numbers(minutes, changes)
@@ -298,7 +328,7 @@ def _live(
         wiki = _pick_wiki(everything.wikis())
     numbers = everything if wiki == ALL_WIKIS else Numbers(minutes, changes, wiki)
 
-    _status(state, window, clock)
+    _status(state, end, ahead, window, clock)
     totals = numbers.totals()
     _tiles(totals, window, detail)
     if totals.changes == 0:
@@ -353,9 +383,8 @@ def _pick_wiki(active: list[tuple[str, int]]) -> str:
     return str(picked or ALL_WIKIS)
 
 
-def _status(state: LakeState, window: Window, clock: datetime) -> None:
-    assert state.newest_minute is not None
-    behind = clock - (state.newest_minute + MINUTE)
+def _status(state: LakeState, end: datetime, ahead: int, window: Window, clock: datetime) -> None:
+    behind = clock - (end + MINUTE)
     quiet = clock - state.last_write if state.last_write else timedelta(0)
     written = f"last write {state.last_write:%H:%M:%S}" if state.last_write else "no writes"
     upto = f"Complete minutes up to {window.end:%Y-%m-%d %H:%M} UTC · {written}"
@@ -365,6 +394,11 @@ def _status(state: LakeState, window: Window, clock: datetime) -> None:
     elif behind > LIVE_LAG:
         badge = ":orange-badge[:material/history: Catching up]"
         line = f"The newest counts are {duration(behind)} behind the clock."
+        if ahead:
+            line += (
+                f" {ahead:,} straggling {'change is' if ahead == 1 else 'changes are'} "
+                "counted ahead of them: live changes come mixed into a replay."
+            )
     else:
         badge = ":green-badge[:material/check_circle: Live]"
         line = ""

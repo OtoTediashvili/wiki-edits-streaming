@@ -183,6 +183,20 @@ def test_catching_up_after_time_away(tmp_path: Path, cat: Catalog) -> None:
     assert metrics(app)["Changes per minute"] == "140"
 
 
+def test_stragglers_ahead_of_a_replay_dont_make_it_live(tmp_path: Path, cat: Catalog) -> None:
+    """A replay two hours behind, and the quiet datacenter's live changes
+    already counted a minute ago: the page follows the replay, not them."""
+    bulk = NOW - timedelta(hours=2)
+    fill(cat, newest=bulk)
+    append_minutes(cat, [minute("enwiki", NOW - timedelta(minutes=1), humans=2)])
+    app = run(tmp_path, clock=NOW + timedelta(seconds=20))
+    status = app.markdown[0].value
+    assert "Catching up" in status and "1 h 59 min behind" in status
+    assert "2 straggling changes are counted ahead of them" in status
+    assert f"up to {bulk:%Y-%m-%d %H:%M} UTC" in status
+    assert metrics(app)["Changes per minute"] == "140"
+
+
 def test_a_job_that_stopped_writing(tmp_path: Path, cat: Catalog) -> None:
     fill(cat, newest=NOW - timedelta(minutes=1))
     app = run(tmp_path, clock=NOW + timedelta(minutes=20))
