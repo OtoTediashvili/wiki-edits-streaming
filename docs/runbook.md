@@ -47,12 +47,13 @@ its own is started again by Docker, over and over, until it stays up.
 ## The broker is down (Redpanda)
 
 - **You see:** the producer logs `DeliveryError` (nothing confirmed after
-  30 s) and restarts; the job fails and restarts; *Stalled* on the dashboard
+  30 s) and restarts; the job writes nothing; *Stalled* on the dashboard
   after 5 minutes.
 - **On its own:** the producer exits without saving its position, so when
   the broker is back it asks Wikimedia for everything from its last saved
-  position: the outage is fetched again, not skipped. The job resumes from
-  its checkpoint.
+  position: the outage is fetched again, not skipped. The job doesn't fail:
+  its reads wait for the broker, and it carries on from its checkpoint
+  (in the drills, a one-minute outage never restarted it).
 - **You do:** `make up`.
 - **Drill:** `broker-outage`.
 

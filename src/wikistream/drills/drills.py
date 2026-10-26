@@ -121,8 +121,8 @@ def storage_outage(ctx: Context) -> None:
 
 def broker_outage(ctx: Context) -> None:
     """Redpanda goes away. The producer can't confirm delivery, exits without
-    saving its position and is restarted until the broker is back; the job
-    can't read and does the same. Both resume where they were."""
+    saving its position and is restarted until the broker is back; the job's
+    reads wait for it. Both carry on where they were."""
     seconds = ctx.seconds or 60
     before = {s: stack.restarts(s) for s in ("producer", "spark")}
     ctx.note(f"stop Redpanda for {seconds} s")

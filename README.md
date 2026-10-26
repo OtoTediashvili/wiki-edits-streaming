@@ -23,8 +23,9 @@ The whole design on one page, with the guarantees and the trade-offs:
 ![The dashboard on live data: status, six numbers for the last hour, changes per minute by people and bots, the busiest wikis](docs/dashboard.png)
 
 **Status:** ingestion, the stream job and the live dashboard are done, with
-unit, integration and end-to-end tests in CI, and the tables maintain
-themselves (compaction, snapshot expiry).
+unit, integration and end-to-end tests in CI; the tables maintain
+themselves (compaction, snapshot expiry); and five failure drills, run
+against the live pipeline, pass: nothing lost, nothing twice.
 
 ## The data, measured
 
@@ -246,20 +247,29 @@ and every other day's), how many snapshots are kept and how old the oldest
 is, and what the table takes on disk against what the current snapshot
 needs.
 
-**Measured on the laptop,** after a day of streaming with maintenance
-running:
+**Measured on the laptop,** with `make peek`:
 
-| Table | Current data | On disk | Snapshots kept |
-|---|---|---|---|
-| `changes` | 12.1 million rows, 780 MB in 421 files | 1.5 GB | 349, the oldest 6 h old |
-| `edits_per_minute` | 427,000 rows, 4.6 MB in 111 files | 238 MB | 345, the oldest 6 h old |
+| When | `changes` | On disk | `edits_per_minute` | On disk |
+|---|---|---|---|---|
+| 19 Oct, a day of streaming in | 12.1 million rows, 780 MB in 421 files | 1.5 GB | 4.6 MB in 111 files | 238 MB |
+| 23 Oct, after compaction and expiry | 12.2 million rows, 785 MB in 117 files | 1.0 GB | 4.6 MB in 111 files | 99 MB |
+| 26 Oct, a week later | 17.0 million rows, 1.1 GB in 357 files | 1.3 GB | 6.8 MB in 328 files | 109 MB |
 
-The minute table shows what copy-on-write costs: 98% of its footprint is
-versions the job has since replaced, kept by six hours of snapshots. That's
-about 40 MB an hour, so without expiry a 5 MB table would grow by roughly
-a gigabyte a day. In `changes`, most of the extra 700 MB is the small files
-compaction has replaced. They're deleted once the last snapshot that lists
-them is six hours old.
+Compaction took `changes` from 421 files to 117 for about the same data,
+and with expiry a third came off its footprint on disk: the small files it
+replaced are deleted once the last snapshot that lists them is six hours
+old.
+
+The minute table shows what copy-on-write costs: on 19 October, 98% of its
+footprint was versions the job had since replaced, kept by six hours of
+snapshots. That's about 40 MB an hour, so without expiry a 5 MB table would
+grow by roughly a gigabyte a day.
+
+What's left is mostly small files for changes dated months or years back.
+By 26 October the table spanned 278 different days, and the 277 before
+today held 351 files, about one each: below the five that compaction waits
+for. That is the price of partitioning by the day a change happened, which
+keeps every time-range read pruned to the days it asks for.
 
 **What runs.** Iceberg's own Spark procedures, once an hour inside the
 stream job (between its batches, in the same Spark session, so no second
@@ -307,7 +317,7 @@ running pipeline on purpose, then check the lake against the topic.
 | `producer-crash` | `kill -9` the producer between two checkpoints | It resumes from its saved position and resends up to 5 s of events; the lake keeps one copy of each |
 | `job-crash` | `kill -9` the Spark job in the middle of a batch, three times | Spark replays the unfinished batch; the idempotent writes change nothing already written |
 | `storage-outage` | SeaweedFS (catalog and S3) stopped for 2 minutes | Batches fail, the job exits, Docker restarts it until storage is back, and it catches up |
-| `broker-outage` | Redpanda stopped for 1 minute | Producer and job exit and are restarted; the producer fetches what it missed from Wikimedia |
+| `broker-outage` | Redpanda stopped for 1 minute | The producer exits, is restarted and fetches what it missed from Wikimedia; the job's reads wait for the broker |
 | `poison-message` | Two malformed messages written straight to the topic | The job sets them aside in `wiki.rejected` and carries on |
 
 **How "nothing lost, nothing twice" is checked.** Before breaking anything,
@@ -329,6 +339,38 @@ changes or more) within 5 minutes of the clock. Not just its newest minute:
 while the producer replays a gap, a few live changes from Wikimedia's
 quieter datacenter get counted hours ahead of the rest, and a check on the
 newest minute alone would start a drill hours before the job is ready.
+
+### Results
+
+All five, run twice in a row on 26 October 2026 on the laptop, against the
+live stream. All ten passed: 79,150 messages audited, none missing from the
+lake, none in it twice, all 3,183 per-wiki minute counts right.
+
+| Drill | Messages (run 1 · run 2) | Copies the producer resent | Lake complete, at the latest | Reports |
+|---|---|---|---|---|
+| `producer-crash` | 3,162 · 3,988 | 23 · 2 | 106 s · 76 s | [1](docs/drills/2026-10-26-0800-producer-crash.md) · [2](docs/drills/2026-10-26-0827-producer-crash.md) |
+| `job-crash` | 14,658 · 15,197 | 0 · 0 | 122 s · 123 s | [1](docs/drills/2026-10-26-0802-job-crash.md) · [2](docs/drills/2026-10-26-0829-job-crash.md) |
+| `storage-outage` | 9,501 · 9,954 | 0 · 0 | 137 s · 137 s | [1](docs/drills/2026-10-26-0809-storage-outage.md) · [2](docs/drills/2026-10-26-0836-storage-outage.md) |
+| `broker-outage` | 6,710 · 7,945 | 7 · 37 | 152 s · 152 s | [1](docs/drills/2026-10-26-0814-broker-outage.md) · [2](docs/drills/2026-10-26-0841-broker-outage.md) |
+| `poison-message` | 3,529 · 4,506 | 0 · 0 | 106 s · 106 s | [1](docs/drills/2026-10-26-0818-poison-message.md) · [2](docs/drills/2026-10-26-0845-poison-message.md) |
+
+- **At-least-once upstream, exactly once in the lake.** A producer crash or
+  a broker outage makes the producer send some events again: 69 copies
+  over the ten runs. The job's anti-join on the event id dropped every one.
+- **Six `kill -9`s in the middle of a batch.** Spark replayed each batch
+  from its checkpoint, and none of the replays wrote anything twice.
+- **Two minutes without storage.** The job failed its batches and Docker
+  restarted it 7 and 6 times; once SeaweedFS was back it caught up on its
+  own.
+- **The broker outage didn't go the way I had written it down.** I expected
+  the job to fail and be restarted, like the producer. In both runs Docker
+  restarted only the producer: the job's reads simply waited for Redpanda.
+  The runbook was wrong, and now says what happens.
+- **Four malformed messages** (two per run) went to `wiki.rejected`; the
+  events around them were written as usual.
+- **The times are upper bounds.** After the repair, each drill waits one to
+  two minutes before it reads the topic and audits, so most of each figure
+  is that wait.
 
 What breaks what, and what to do about each, is in the
 [runbook](docs/runbook.md).
