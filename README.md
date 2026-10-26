@@ -319,6 +319,12 @@ It checks until the lake passes or 20 minutes are up, and the report in
 the broken part was back the lake had everything. The job is caught in the
 middle of a batch through Spark's REST API, not by luck.
 
+A drill only starts once the job is live: its newest *full* minute (100
+changes or more) within 5 minutes of the clock. Not just its newest minute:
+while the producer replays a gap, a few live changes from Wikimedia's
+quieter datacenter get counted hours ahead of the rest, and a check on the
+newest minute alone would start a drill hours before the job is ready.
+
 What breaks what, and what to do about each, is in the
 [runbook](docs/runbook.md).
 
@@ -355,7 +361,7 @@ Memory, for an 8 GB laptop: Redpanda is capped at 1 GB, Spark's driver at
 
 ## Tests
 
-- **207 unit tests** (`make test`), no network or Docker:
+- **214 unit tests** (`make test`), no network or Docker:
   - the producer: SSE parsing, field mapping and validation against the real
     recording, reconnect and resume against mocked HTTP responses (including
     a datacenter with no position yet, for every id in the recording), the

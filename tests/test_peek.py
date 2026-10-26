@@ -5,8 +5,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tests.dashboard.lakes import NAMESPACE, arrow, create_tables, minute, schema
-from wikistream.streaming.peek import describe, footprint, set_aside
+from tests.dashboard.lakes import (
+    NAMESPACE,
+    append_minutes,
+    arrow,
+    create_tables,
+    minute,
+    open_lake,
+    schema,
+)
+from wikistream.streaming.peek import describe, footprint, newest_minutes, set_aside
 from wikistream.streaming.settings import EDITS_PER_MINUTE, REJECTED
 from wikistream.streaming.transform import MINUTE_COLUMNS, REJECTED_COLUMNS
 
@@ -81,3 +89,48 @@ def test_what_was_set_aside_and_why(tmp_path: Path) -> None:
         "wiki.rejected: 3 messages set aside, the latest from 2026-10-19 10:05 UTC "
         "(2 no schema registry header, 1 empty message)"
     )
+
+
+def test_the_newest_minutes_of_a_live_job(tmp_path: Path) -> None:
+    cat = create_tables(tmp_path)
+    append_minutes(
+        cat, [minute("enwiki", T0 + timedelta(minutes=m), humans=150) for m in range(12)]
+    )
+    # The newest minute is still filling: not full yet, and no straggler.
+    last = T0 + timedelta(minutes=12)
+    append_minutes(
+        cat, [minute("enwiki", last, humans=30, bots=10), minute("dewiki", last, humans=2)]
+    )
+
+    text = newest_minutes(open_lake(tmp_path), last + timedelta(seconds=40))
+    lines = text.splitlines()
+    assert lines[0] == "Newest minutes (live). The newest may still be filling."
+    assert lines[2] == "2026-10-19 10:12         42    24%       2"
+    assert lines[-1] == "2026-10-19 10:03        150     0%       1"
+    assert len(lines) == 2 + 10
+    assert "straggling" not in text
+
+
+def test_stragglers_ahead_of_a_replay_are_set_apart(tmp_path: Path) -> None:
+    """Full minutes up to 10:11, and the quiet datacenter's live changes
+    counted hours ahead: the job is nearly three hours behind, not live."""
+    cat = create_tables(tmp_path)
+    append_minutes(
+        cat, [minute("enwiki", T0 + timedelta(minutes=m), humans=150) for m in range(12)]
+    )
+    ahead = T0 + timedelta(hours=3)
+    append_minutes(cat, [minute("enwiki", ahead, humans=1), minute("frwiki", ahead, bots=2)])
+
+    text = newest_minutes(open_lake(tmp_path), ahead + timedelta(seconds=30))
+    lines = text.splitlines()
+    assert lines[0] == "Newest full minutes (2.8 hours behind the clock: catching up)."
+    assert lines[2].startswith("2026-10-19 10:11 ")
+    assert lines[-1] == (
+        "Ahead of these: 3 straggling changes, up to 2026-10-19 13:00 (live changes come "
+        "mixed into a replay). The newest full minute is how far the job has got."
+    )
+
+
+def test_no_minutes_yet(tmp_path: Path) -> None:
+    create_tables(tmp_path)
+    assert newest_minutes(open_lake(tmp_path), T0) == "No minutes counted yet."

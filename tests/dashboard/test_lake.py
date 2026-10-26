@@ -23,7 +23,14 @@ from tests.dashboard.lakes import (
     minute,
     open_lake,
 )
-from wikistream.dashboard.lake import CHANGE_FIELDS, Lake, LakeState, naive_utc
+from wikistream.dashboard.lake import (
+    CHANGE_FIELDS,
+    Lake,
+    LakeState,
+    Position,
+    naive_utc,
+    position,
+)
 
 DAY = datetime(2026, 10, 19)
 
@@ -87,6 +94,41 @@ def test_missing_tables_say_so(tmp_path: Path) -> None:
     """Before the job's first start: a catalog, no tables."""
     with pytest.raises(NoSuchTableError):
         Lake(catalog(tmp_path), NAMESPACE).state()
+
+
+def test_the_position_is_the_newest_full_minute_not_a_straggler_ahead(
+    cat: Catalog, lake: Lake
+) -> None:
+    """A replay: full minutes up to 09:59, and the quiet datacenter's live
+    changes, a couple a minute, already counted two hours ahead."""
+    bulk = DAY + timedelta(hours=9)
+    append_minutes(
+        cat,
+        [minute("enwiki", bulk + timedelta(minutes=m), humans=60, bots=20) for m in range(60)]
+        # Two wikis that make a full minute only together.
+        + [minute("dewiki", bulk + timedelta(minutes=60), humans=50)]
+        + [minute("frwiki", bulk + timedelta(minutes=60), bots=50)],
+    )
+    ahead = DAY + timedelta(hours=12)
+    append_minutes(cat, [minute("enwiki", ahead, humans=1), minute("commonswiki", ahead, bots=2)])
+    append_minutes(cat, [minute("enwiki", ahead + timedelta(minutes=3), humans=1)])
+
+    assert lake.position() == Position(
+        full_minute=bulk + timedelta(minutes=60),
+        newest_minute=ahead + timedelta(minutes=3),
+        ahead=4,
+    )
+    # Looking back only an hour from 12:10: stragglers, no full minute.
+    assert lake.position(since=ahead - timedelta(minutes=50)) == Position(
+        None, ahead + timedelta(minutes=3), 4
+    )
+
+
+def test_the_position_of_a_lake_without_counts(lake: Lake) -> None:
+    assert lake.position() == Position(None, None, 0)
+    assert position(pa.table({"window_start": pa.array([], pa.timestamp("us"))})) == Position(
+        None, None, 0
+    )
 
 
 def test_minutes_in_a_window_and_only_their_files(

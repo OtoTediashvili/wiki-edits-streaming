@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from wikistream.dashboard.lake import Lake
+from wikistream.dashboard.lake import FULL_MINUTE, Lake, Position
+from wikistream.dashboard.queries import duration
 from wikistream.drills import stack, topic
 from wikistream.drills.audit import Audit, audit, ranges_for
 from wikistream.drills.lakeview import LakeView
@@ -17,9 +18,14 @@ from wikistream.streaming.settings import LakeSettings
 
 SERVICES = ("redpanda", "seaweedfs", "producer", "spark")
 REPORTS = Path("docs/drills")
-# The newest counted minute must be this close to the clock before a drill:
-# a job still catching up would make the timings meaningless.
+# The newest full minute must be this close to the clock before a drill: a
+# job still catching up would make the timings meaningless, and the audit
+# would time out waiting for the backlog. Not the newest minute: while a
+# replay is going on, a straggler can sit hours ahead of it.
 LIVE = timedelta(minutes=5)
+# How far back the preflight looks for a full minute; further behind than
+# that is just "more than an hour" (`make peek` says exactly).
+LOOK_BACK = timedelta(hours=1)
 
 
 def utc_now() -> datetime:
@@ -53,9 +59,14 @@ class Context:
     now: Callable[[], datetime] = utc_now
 
     def note(self, text: str) -> None:
+        """A step of the drill: printed, and in the report."""
         step = Step(self.now(), text)
         self.steps.append(step)
         print(f"{step.at:%H:%M:%S}  {text}", flush=True)
+
+    def say(self, text: str) -> None:
+        """Printed only: what happens before the drill isn't part of it."""
+        print(f"{self.now():%H:%M:%S}  {text}", flush=True)
 
     def restored(self) -> None:
         self.restored_at = self.clock()
@@ -159,22 +170,49 @@ class Report:
 
 def preflight(ctx: Context, wait_minutes: float = 10) -> None:
     """Every service up, and the job live: waits for a job that is still
-    catching up (after the previous drill, say), then gives up."""
+    catching up (after the previous drill, say), saying where it is about
+    once a minute, then gives up."""
     down = [s for s in SERVICES if not stack.running(s)]
     if down:
         raise NotReadyError(f"not running: {', '.join(down)}. Start the stack first.")
     lake = Lake(rest_catalog(ctx.lake), ctx.lake.lake_namespace)
     deadline = ctx.clock() + wait_minutes * 60
+    told: float | None = None
     while True:
-        newest = lake.state().newest_minute
-        if newest is not None and ctx.now() - newest <= LIVE:
+        now = ctx.now()
+        position = lake.position(since=now - LOOK_BACK)
+        if position.full_minute is not None and now - position.full_minute <= LIVE:
             return
-        if ctx.clock() >= deadline:
+        left = timedelta(seconds=deadline - ctx.clock())
+        if left <= timedelta(0):
             raise NotReadyError(
-                f"the job isn't live yet (newest counted minute: {newest or 'none'}). "
+                f"the job isn't live yet. {whereabouts(position, now)}. "
                 "Let it catch up first: make peek."
             )
+        if told is None or ctx.clock() - told >= 60:
+            ctx.say(
+                f"Waiting for the job to catch up. {whereabouts(position, now)}. "
+                f"Up to {duration(left)} more."
+            )
+            told = ctx.clock()
         ctx.sleep(15)
+
+
+def whereabouts(position: Position, now: datetime) -> str:
+    """Where the lake is, for a person: from the newest full minute."""
+    if position.full_minute is None:
+        since = now - LOOK_BACK
+        where = f"No minute since {since:%H:%M} UTC has {FULL_MINUTE} changes or more"
+        straggling = "since then"
+    else:
+        full, behind = position.full_minute, now - position.full_minute
+        where = f"The newest full minute is {full:%H:%M} UTC, {duration(behind)} ago"
+        straggling = "ahead of it"
+    if position.straggling:
+        one = position.ahead == 1
+        count = f"{position.ahead:,} straggling change" + ("" if one else "s")
+        where += f"; {count} {'is' if one else 'are'} counted {straggling}"
+    return where
 
 
 def run(

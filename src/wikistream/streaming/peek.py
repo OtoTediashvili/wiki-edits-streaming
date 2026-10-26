@@ -14,13 +14,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlparse
 
-import pyarrow as pa
 import pyarrow.compute as pc
 from pyarrow.fs import FileSelector, FileType
-from pyiceberg.catalog import Catalog
 from pyiceberg.io.pyarrow import PyArrowFileIO
 from pyiceberg.table import Table
 
+from wikistream.dashboard.lake import Lake
 from wikistream.streaming.catalog import rest_catalog
 from wikistream.streaming.settings import CHANGES, EDITS_PER_MINUTE, REJECTED, LakeSettings
 
@@ -119,29 +118,53 @@ def set_aside(table: Table, identifier: str) -> str:
     )
 
 
-def _newest_minutes(catalog: Catalog, identifier: str, minutes: int = 10) -> pa.Table:
-    """Totals for the newest minutes in the table, whatever the clock says:
-    while the job catches up on history, those are hours or days old."""
-    table = catalog.load_table(identifier)
-    starts = table.scan(selected_fields=("window_start",)).to_arrow()["window_start"]
-    if len(starts) == 0:
-        return pa.table({})
-    newest = max(starts.to_pylist())
-    since = newest - timedelta(minutes=minutes - 1)
-    rows = table.scan(row_filter=f"window_start >= '{since.isoformat()}'").to_arrow()
-    per_minute = rows.group_by("window_start").aggregate(
-        [("events", "sum"), ("bot_events", "sum"), ("wiki", "count_distinct")]
-    )
-    return per_minute.sort_by([("window_start", "descending")])
-
-
-def _behind(newest: datetime) -> str:
-    seconds = (datetime.now(UTC) - newest).total_seconds()
+def _behind(newest: datetime, now: datetime) -> str:
+    seconds = (now - newest).total_seconds()
     if seconds < 600:
         return "live"
     if seconds < 86_400:
         return f"{seconds / 3600:.1f} hours behind the clock: catching up"
     return f"{seconds / 86_400:.1f} days behind the clock: catching up"
+
+
+def newest_minutes(lake: Lake, now: datetime, minutes: int = 10) -> str:
+    """Totals for the newest minutes counted, and how far behind the clock
+    (`now`, naive UTC) they are: while the job catches up on history, hours
+    or days. During a replay a few straggling changes can be counted hours
+    ahead of the rest; the list then ends at the newest full minute, and a
+    line says what is counted ahead of it."""
+    position = lake.position()
+    if position.newest_minute is None:
+        return "No minutes counted yet."
+    full = position.full_minute
+    split = full is not None and position.straggling
+    end = full if split and full is not None else position.newest_minute
+    rows = lake.minutes(end - timedelta(minutes=minutes - 1), end + timedelta(minutes=1))
+    per_minute = rows.group_by("window_start").aggregate(
+        [("events", "sum"), ("bot_events", "sum"), ("wiki", "count_distinct")]
+    )
+    per_minute = per_minute.sort_by([("window_start", "descending")])
+    if split:
+        lines = [f"Newest full minutes ({_behind(end, now)})."]
+    else:
+        lines = [f"Newest minutes ({_behind(end, now)}). The newest may still be filling."]
+    lines.append("minute (UTC)       events   bots   wikis")
+    for start, events, bots, wikis in zip(
+        per_minute["window_start"].to_pylist(),
+        per_minute["events_sum"].to_pylist(),
+        per_minute["bot_events_sum"].to_pylist(),
+        per_minute["wiki_count_distinct"].to_pylist(),
+        strict=True,
+    ):
+        share = bots / events if events else 0.0
+        lines.append(f"{start:%Y-%m-%d %H:%M}  {events:>9,}  {share:>5.0%}  {wikis:>6}")
+    if split:
+        lines.append(
+            f"Ahead of these: {_n(position.ahead, 'straggling change')}, up to "
+            f"{position.newest_minute:%Y-%m-%d %H:%M} (live changes come mixed into a "
+            "replay). The newest full minute is how far the job has got."
+        )
+    return "\n".join(lines)
 
 
 def main() -> int:
@@ -155,22 +178,8 @@ def main() -> int:
     rejected = f"{namespace}.{REJECTED}"
     if catalog.table_exists(rejected):
         print(set_aside(catalog.load_table(rejected), rejected))
-    newest = _newest_minutes(catalog, f"{namespace}.{EDITS_PER_MINUTE}")
-    if newest.num_rows == 0:
-        print("\nNo minutes counted yet.")
-        return 0
-    starts = newest["window_start"].to_pylist()
-    print(f"\nNewest minutes ({_behind(starts[0])}). The newest may still be filling.")
-    print("minute (UTC)       events   bots   wikis")
-    for start, events, bots, wikis in zip(
-        starts,
-        newest["events_sum"].to_pylist(),
-        newest["bot_events_sum"].to_pylist(),
-        newest["wiki_count_distinct"].to_pylist(),
-        strict=True,
-    ):
-        share = bots / events if events else 0.0
-        print(f"{start:%Y-%m-%d %H:%M}  {events:>9,}  {share:>5.0%}  {wikis:>6}")
+    print()
+    print(newest_minutes(Lake(catalog, namespace), now.replace(tzinfo=None)))
     return 0
 
 

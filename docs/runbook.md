@@ -85,11 +85,17 @@ its own is started again by Docker, over and over, until it stays up.
 ## The job is far behind
 
 - **You see:** *Catching up* on the dashboard, batches of 200,000 events,
-  `make peek` hours behind.
+  `make peek` hours behind. While the producer replays a gap, `make peek`
+  may also report a few straggling changes counted hours ahead of the
+  rest: live changes from Wikimedia's quieter datacenter, mixed into the
+  replay. They're real changes, counted like any other; how far the job
+  has got is the newest *full* minute (100 changes or more), which is what
+  `make peek` measures from.
 - **On its own:** it works through the backlog, about 15 batches for a day
   of edits.
 - **You do:** nothing. Don't run drills meanwhile: they wait up to 10
-  minutes for the job to be live, then refuse.
+  minutes for a full minute within 5 minutes of the clock, saying how far
+  behind the job is once a minute, then refuse.
 
 ## Maintenance failed
 

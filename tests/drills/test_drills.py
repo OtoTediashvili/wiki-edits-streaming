@@ -10,9 +10,17 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
-from wikistream.dashboard.lake import LakeState
+from wikistream.dashboard.lake import Position
 from wikistream.drills import drills, stack, topic
-from wikistream.drills.drills import Context, NotReadyError, preflight, render, run, save
+from wikistream.drills.drills import (
+    Context,
+    NotReadyError,
+    preflight,
+    render,
+    run,
+    save,
+    whereabouts,
+)
 from wikistream.drills.topic import Sent
 from wikistream.streaming.settings import LakeSettings
 
@@ -110,25 +118,49 @@ def test_no_drill_on_a_stack_that_is_down_or_behind(
         preflight(ctx)
 
     monkeypatch.setattr(stack, "running", lambda s: True)
-    newest = [T - timedelta(hours=2)]
+    full = [T - timedelta(hours=2)]
 
     class FakeLake:
         def __init__(self, *args: Any) -> None:
             pass
 
-        def state(self) -> LakeState:
-            return LakeState(newest[0], T)
+        def position(self, since: datetime) -> Position:
+            return Position(full[0], full[0], 0)
 
     monkeypatch.setattr(drills, "Lake", FakeLake)
     monkeypatch.setattr(drills, "rest_catalog", lambda settings: None)
-    with pytest.raises(NotReadyError, match="isn't live yet"):
+    refusal = r"isn't live yet\. The newest full minute is 16:00 UTC, 2 h 1 min ago\. Let it"
+    with pytest.raises(NotReadyError, match=refusal):
         preflight(ctx, wait_minutes=1)
-    newest[0] = T - timedelta(minutes=2)
+    full[0] = T - timedelta(minutes=2)
     preflight(ctx)  # live: no complaint
 
 
-def test_a_drill_waits_for_a_job_still_catching_up(
-    ctx: Context, clock: Clock, monkeypatch: pytest.MonkeyPatch
+def test_a_straggler_ahead_of_a_replay_is_not_live(
+    ctx: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The quiet datacenter's live changes, mixed into a replay: the newest
+    minute is a minute old, the newest full one two hours."""
+    monkeypatch.setattr(stack, "running", lambda s: True)
+    looked_since: list[datetime] = []
+
+    class Replaying:
+        def __init__(self, *args: Any) -> None:
+            pass
+
+        def position(self, since: datetime) -> Position:
+            looked_since.append(since)
+            return Position(T - timedelta(hours=2), T - timedelta(minutes=1), 3)
+
+    monkeypatch.setattr(drills, "Lake", Replaying)
+    monkeypatch.setattr(drills, "rest_catalog", lambda settings: None)
+    with pytest.raises(NotReadyError, match="3 straggling changes are counted ahead of it"):
+        preflight(ctx, wait_minutes=1)
+    assert looked_since[0] == T - timedelta(hours=1)
+
+
+def test_a_drill_waits_for_a_job_still_catching_up_and_says_so(
+    ctx: Context, clock: Clock, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(stack, "running", lambda s: True)
 
@@ -136,15 +168,38 @@ def test_a_drill_waits_for_a_job_still_catching_up(
         def __init__(self, *args: Any) -> None:
             pass
 
-        def state(self) -> LakeState:
-            # Live from the third look on (the clock moves 15 s per look).
-            behind = timedelta(hours=1) if clock.seconds < 30 else timedelta(minutes=1)
-            return LakeState(ctx.now() - behind, T)
+        def position(self, since: datetime) -> Position:
+            # Live after five looks (the clock moves 15 s per look); before,
+            # more than the hour it looks back.
+            if clock.seconds < 75:
+                return Position(None, None, 0)
+            return Position(ctx.now() - timedelta(minutes=1), ctx.now(), 40)
 
     monkeypatch.setattr(drills, "Lake", CatchingUp)
     monkeypatch.setattr(drills, "rest_catalog", lambda settings: None)
     preflight(ctx)
-    assert clock.seconds == 30
+    assert clock.seconds == 75
+    said = capsys.readouterr().out.splitlines()
+    assert said == [
+        "18:00:10  Waiting for the job to catch up. No minute since 17:00 UTC has 100 changes"
+        " or more. Up to 10 min more.",
+        "18:01:10  Waiting for the job to catch up. No minute since 17:01 UTC has 100 changes"
+        " or more. Up to 9 min more.",
+    ]
+    assert ctx.steps == []  # the wait isn't part of the drill's report
+
+
+def test_whereabouts_mention_stragglers_only_beyond_the_filling_minute() -> None:
+    full = T - timedelta(minutes=30)
+    filling = Position(full, full + timedelta(minutes=1), 40)
+    assert whereabouts(filling, T) == "The newest full minute is 17:30 UTC, 30 min ago"
+    ahead = Position(full, full + timedelta(minutes=20), 12_345)
+    assert whereabouts(ahead, T).endswith("; 12,345 straggling changes are counted ahead of it")
+    alone = Position(None, T - timedelta(minutes=3), 1)
+    assert whereabouts(alone, T) == (
+        "No minute since 17:00 UTC has 100 changes or more; "
+        "1 straggling change is counted since then"
+    )
 
 
 def lake(ids: list[str]) -> pa.Table:
