@@ -41,6 +41,9 @@ services:
       timeout: 5s
       retries: 24
       start_period: 10s
+    # Same policy as the services that need it: when Docker itself restarts,
+    # the broker comes back too, not just the producer and the job.
+    restart: unless-stopped
 
   console:
     image: docker.redpanda.com/redpandadata/console:v3.11.0
@@ -64,6 +67,7 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
+    restart: unless-stopped
 
   producer:
     build: .
@@ -121,6 +125,8 @@ services:
       timeout: 5s
       retries: 24
       start_period: 10s
+    # The job and the dashboard restart on their own; their storage has to too.
+    restart: unless-stopped
 
   spark:
     build:
