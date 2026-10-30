@@ -249,6 +249,8 @@ def test_charts_keep_people_and_bots_in_fixed_colors_in_both_themes() -> None:
     assert "'type': 'utc'" in str(drawn)
     [rows] = drawn["datasets"].values()
     assert [row["minute"] for row in rows] == [f"{NOW:%Y-%m-%dT%H:%M:%S}+00:00"]
+    # Ticks at least a minute apart: at 30 s, every HH:MM label showed twice.
+    assert "'tickMinStep': 60000" in str(drawn)
 
 
 def test_the_launcher_runs_this_app_with_fixed_options(monkeypatch: pytest.MonkeyPatch) -> None:

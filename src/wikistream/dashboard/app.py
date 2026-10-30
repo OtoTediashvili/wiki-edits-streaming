@@ -46,6 +46,7 @@ from wikistream.streaming.catalog import rest_catalog
 from wikistream.streaming.settings import LakeSettings
 
 TITLE = "Wikipedia edits, live"
+MINUTE_MS = 60_000
 
 # Live: the newest complete minute is at most this far behind the clock.
 LIVE_LAG = timedelta(minutes=5)
@@ -116,7 +117,11 @@ def minute_chart(per_minute: pd.DataFrame, colors: Palette) -> alt.LayerChart:
         minute=per_minute["minute"].dt.tz_localize("UTC"),
         label=per_minute["minute"].dt.strftime("%Y-%m-%d %H:%M"),
     )
-    x = alt.X("minute:T", title=None, scale=alt.Scale(type="utc"), axis=alt.Axis(format="%H:%M"))
+    # Labels name whole minutes, so ticks are at least a minute apart: in a
+    # 15-minute window Vega would otherwise tick every 30 s and print each
+    # minute twice.
+    axis = alt.Axis(format="%H:%M", tickMinStep=MINUTE_MS)
+    x = alt.X("minute:T", title=None, scale=alt.Scale(type="utc"), axis=axis)
     y = alt.Y("changes:Q", title="Changes per minute", axis=alt.Axis(labelExpr=SHORT_NUMBER))
     color = alt.Color("who:N", scale=_who(colors), legend=alt.Legend(title=None, orient="top"))
     series = alt.Chart(data).transform_fold(["Humans", "Bots"], as_=["who", "changes"])
